@@ -7,6 +7,12 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.5 prevents the 180-second timeout during the WinRM reset. Listener
+removal is now verified while WinRM is still running. After the service has
+been stopped and disabled, Mavi confirms the final state only through the
+local service manager and the registry start value, without contacting the
+already disabled WSMan or CIM channel again.
+
 v0.9.4 adds a repeatable WinRM/Kerberos reset over the existing OpenSSH key.
 It removes all WinRM listeners, Mavi WinRM firewall rules, certificates,
 policy values and working files from the selected Windows endpoint, then
@@ -69,7 +75,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 # Ein neues Projekt wird bewusst außerhalb des Quell-Repositorys angelegt.
 # So bleiben Umgebungswerte, Inventories, Zertifikate und Secrets getrennt
 # vom veröffentlichbaren Programmcode.
@@ -16171,6 +16177,7 @@ $removedCertificates = 0
 $removedFirewallRules = 0
 $removedOpenSshKeys = 0
 $openSshDisableScheduled = $false
+$remainingListeners = -1
 $cleanupError = $null
 
 try {
@@ -16193,6 +16200,12 @@ try {
     foreach ($listener in $listeners) {
         Remove-Item -LiteralPath $listener.PSPath -Recurse -Force -ErrorAction Stop
         $removedListeners++
+    }
+    # Den WSMan-Provider nur abfragen, solange WinRM noch läuft. Ein Zugriff
+    # nach Stop/Disable kann lokal bis zum Ansible-Timeout blockieren.
+    $remainingListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop).Count
+    if ($remainingListeners -ne 0) {
+        throw 'Mavi WinRM Reset: Nicht alle WinRM-Listener konnten entfernt werden.'
     }
 
     foreach ($name in $firewallNames) {
@@ -16264,17 +16277,13 @@ if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
     throw "Mavi WinRM Reset wurde nicht vollständig ausgeführt: $cleanupError"
 }
 
-$remainingListeners = 0
-try {
-    $remainingListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop).Count
-}
-catch {
-    # Der Dienst ist jetzt absichtlich deaktiviert. Die zuvor erfolgreiche
-    # Entfernung ist der maßgebliche Listener-Nachweis.
-    $remainingListeners = 0
-}
-$service = Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction Stop
-if ($remainingListeners -ne 0 -or [string]$service.State -ne 'Stopped' -or [string]$service.StartMode -ne 'Disabled') {
+$service = Get-Service -Name WinRM -ErrorAction Stop
+$serviceStartValue = [int](Get-ItemPropertyValue `
+    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM' `
+    -Name Start `
+    -ErrorAction Stop
+)
+if ($remainingListeners -ne 0 -or [string]$service.Status -ne 'Stopped' -or $serviceStartValue -ne 4) {
     throw 'Mavi WinRM Reset: Der abschließende Stand-0-Nachweis ist fehlgeschlagen.'
 }
 
@@ -16377,8 +16386,8 @@ $Ansible.Result = @{
     RemovedFirewallRules = $removedFirewallRules
     RemovedOpenSshKeys = $removedOpenSshKeys
     OpenSshDisableScheduled = $openSshDisableScheduled
-    WinRMState = [string]$service.State
-    WinRMStartMode = [string]$service.StartMode
+    WinRMState = [string]$service.Status
+    WinRMStartMode = 'Disabled'
 }
 $Ansible.Changed = $true
 '''
@@ -19502,6 +19511,7 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
         vault_password = ""
 
     try:
+        print("\nRückbau läuft über OpenSSH; das Ergebnis erscheint nach Abschluss (maximal 180 Sekunden).")
         _run_winrm_temporary_play(
             args.project,
             host=args.host,

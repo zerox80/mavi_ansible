@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5-oss
+
+- WinRM-Listenerfreiheit wird beim Stand-0-Rückbau geprüft, solange WinRM noch läuft.
+- Die Abschlussprüfung verwendet nach dem Stoppen ausschließlich den lokalen Dienststatus und den Registry-Startwert; dadurch wartet der Rückbau nicht mehr auf einen bereits deaktivierten WSMan-/CIM-Kanal.
+- Fortschrittshinweis für den bis zu 180 Sekunden laufenden OpenSSH-Rückbau ergänzt.
+
 ## 0.9.4-oss
 
 - Wiederholbaren WinRM/Kerberos-Stand-0-Rückbau über den bestehenden OpenSSH-Kanal ergänzt.
