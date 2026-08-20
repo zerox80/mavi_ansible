@@ -2,7 +2,8 @@
 
 Mavi Provisioner ist eine TUI-first-Umgebung für die Provisionierung von
 Windows-Endpunkten mit Ansible. Sie bündelt Softwarekataloge, WinGet,
-Microsoft Store, Drucker, OpenSSH sowie optional PSRP/WinRM mit Kerberos.
+Microsoft Store, Windows-Client-Optimierung und Programmbereinigung, Drucker,
+OpenSSH sowie optional PSRP/WinRM mit Kerberos.
 
 Das Repository enthält absichtlich keine Firmenwerte: keine Domains, IPs,
 Shares, Benutzer, Zertifikate, Inventories, Installer oder Kennwörter. Jede
@@ -31,7 +32,8 @@ Die Startansicht führt in dieser Reihenfolge durch die erste Umgebung:
    verschlüsselt in Ansible Vault speichern. Es wird kein Kennwort in der
    Konfigurationsdatei oder als Kommandozeilenargument abgelegt.
 3. **PCs & Verbindung** – ersten PC ins Inventory aufnehmen und bei Bedarf den
-   vorhandenen Ein-Klick-OpenSSH-Weg verwenden.
+   vorhandenen Ein-Klick-OpenSSH-Weg verwenden. Dort lassen sich anschließend
+   auch Schnellstart, Bildschirmtimeouts und klassische Programme verwalten.
 4. **Software, Kataloge und Microsoft-Produkte** – Installer, WinGet,
    Microsoft Store und Drucker einrichten.
 
@@ -129,5 +131,6 @@ abzuzeichnen. Beiträge sind willkommen; siehe [CONTRIBUTING.md](CONTRIBUTING.md
 
 Die vollständige Funktionsoberfläche enthält weiterhin Katalogverwaltung,
 Parameterprofile, Office-/Microsoft-Assistent, Drucker, WinGet, Microsoft
-Store, OpenSSH, PSRP/WinRM und Diagnosen. Die Architektur ist in
+Store, Windows-Client-Optimierung und Programmbereinigung, OpenSSH, PSRP/WinRM
+und Diagnosen. Die Architektur ist in
 [docs/architecture.md](docs/architecture.md) beschrieben.

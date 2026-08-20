@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.7-oss
+
+- Windows-Client-Menü zum Deaktivieren des Schnellstarts bei erhaltenem Ruhezustand und zum getrennten Einstellen der Bildschirmtimeouts für Netz- und Akkubetrieb ergänzt.
+- Klassische Windows-Programme werden dynamisch aus Maschinen- und aktuellem Benutzerkontext gelesen, durchsuchbar mehrfach ausgewählt und strikt nacheinander unbeaufsichtigt deinstalliert.
+- Microsoft-365-Einträge können vorab markiert werden; Office 2024, Project und Visio bleiben dabei ausgeschlossen.
+- Alle Optimierungs-, Inventar-, Deinstallations- und Erreichbarkeitsläufe verwenden dieselbe gebundene Ansible-Sitzung samt privatem Kerberos-Ticket-Cache.
+- Fehlgeschlagene Client-Playbooks zeigen die tatsächliche relevante Ansible-Fehlerzeile statt nur der PLAY-RECAP-Zusammenfassung.
+- Neue CLI-Befehle `client optimize` und `client uninstall` ergänzt.
+
 ## 0.9.6-oss
 
 - Vollständigen Software-Installationslauf an eine einzige gebundene Ansible-Sitzung gekoppelt.
