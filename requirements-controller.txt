@@ -1,0 +1,5 @@
+# Unterstützte Controller-Kombination für Mavi Provisioner 0.9.3.
+# Python 3.11+ ist erforderlich. Ansible-Collections werden separat über
+# collections/requirements.yml installiert.
+-r requirements.txt
+ansible-core==2.19.12

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Mavi runtime projects and generated sensitive material
+inventory/
+software/mavi_config.yml
+software/catalog.yml
+software/catalogs/
+software/office_configs/
+software/installer_rules.yml
+software/parameter_backups.yml
+printers/catalog.yml
+playbooks/
+reports/
+.ssh/
+.mavi-winrm-pki/
+.mavi-kerberos/
+
+# Secrets and local certificates
+*.vault
+*.pem
+*.key
+*.pfx
+*.p12
+*.csr
+ansible.cfg
+vault_password*
+
+# Keep only explicitly curated generic examples.
+!examples/
+!examples/**

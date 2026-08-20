@@ -1,0 +1,60 @@
+# Generic, non-secret example. Copy this only into a separate runtime project;
+# never commit the resulting mavi_config.yml.
+profile:
+  schema_version: 2
+  name: "Example environment"
+  setup_completed: false
+
+local_admin_user: ""
+
+# Nicht geheim; das Passwort wird ausschließlich durch
+# `mavi-provisioner credentials setup` in dieser Vault-Datei gespeichert.
+identity:
+  ansible_user: ""
+  vault_path: inventory/group_vars/windows/vault.yml
+
+default_catalog: default
+
+# Set by the TUI setup assistant.
+ansible_server_ip: ""
+bootstrap_base_url: ""
+bootstrap_local_dir: ""
+bootstrap_allowed_cidrs: []
+bootstrap_ca_validity_days: 825
+bootstrap_server_cert_validity_days: 90
+bootstrap_launcher_local_dir: ""
+bootstrap_launcher_windows_dir: ""
+openssh_msi_expected_signer: ""
+
+software_source:
+  kind: local
+  label: ""
+  drive: ""
+  unc_root: ""
+  local_root: ""
+
+# Windows / UNC path -> controller-local path
+path_mappings: {}
+
+ssh:
+  port: 22
+  private_key: ""
+
+winrm_https:
+  domain_suffix: ""
+  port: 5986
+  auth: kerberos
+  kerberos_principal: ""
+  kerberos_dns_server: ""
+  message_encryption: always
+  disable_http_after_verified: true
+
+ui:
+  visible_install_contexts:
+    - machine
+    - system
+    - user_interactive
+    - machine_detached
+    - machine_interactive
+    - user_uac
+  install_contexts_schema: 2

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mavi-provisioner"
+version = "0.9.3"
+description = "TUI-first Windows provisioning with Ansible"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Mavi Provisioner contributors" }]
+dependencies = [
+  "PyYAML>=6.0.3,<7",
+]
+
+[project.optional-dependencies]
+pe = ["pefile==2024.8.26"]
+
+[project.scripts]
+mavi-provisioner = "mavi_provisioner:main"
+
+[tool.setuptools]
+py-modules = ["mavi_provisioner"]

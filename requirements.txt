@@ -1,0 +1,7 @@
+# Reproduzierbare Basisinstallation. Versionswechsel werden bewusst als
+# eigener Dependency-Update geprüft und nicht stillschweigend aufgelöst.
+PyYAML==6.0.3
+
+# Optionaler PE-Metadaten-Scan. Wer ihn nicht benötigt, installiert nur das
+# Projekt beziehungsweise diese Datei ohne die folgende Extra-Anforderung.
+pefile==2024.8.26
