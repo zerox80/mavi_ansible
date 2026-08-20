@@ -19156,19 +19156,19 @@ $Ansible.Changed = ($removed.Count -gt 0)
 
 
 def cmd_ssh_remove_keys(args: argparse.Namespace) -> None:
-    """Mavi-Keys entfernen; SSH-Hosts nur auf geprüftes PSRP-HTTPS/Kerberos umstellen."""
+    """Mavi-Keys nach ausdrücklicher Bestätigung vom Windows-PC entfernen."""
     ensure_initialized(args.project, quiet=True)
     inv, windows, host_data = _host_inventory_entry(args.project, args.host)
     del inv
     connection_before = _connection_label(windows, host_data)
+    saved_winrm_available = False
     if connection_before == "SSH":
         try:
             _saved_winrm_https_transport(args.project, host_data)
-        except ValueError as exc:
-            die(
-                "SICHERHEITSABBRUCH: SSH-Keys werden nicht entfernt, weil kein geprüfter "
-                "WinRM-HTTPS/Kerberos-Verwaltungsweg vorhanden ist. " + str(exc)
-            )
+        except ValueError:
+            pass
+        else:
+            saved_winrm_available = True
 
     if not bool(getattr(args, "yes", False)):
         print("\nMavi SSH-KEYS ENTFERNEN")
@@ -19179,8 +19179,17 @@ def cmd_ssh_remove_keys(args: argparse.Namespace) -> None:
         print("und der aktuell auf dem Ansible-Server konfigurierte Mavi-Public-Key.")
         print("Andere Einträge in administrators_authorized_keys bleiben erhalten.")
         if connection_before == "SSH":
-            print("! Danach wird dieser Host auf das geprüfte PSRP/WinRM HTTPS + Kerberos umgestellt.")
-        if not yes_no("Mavi SSH-Key(s) auf diesem PC wirklich entfernen?", default=False):
+            if saved_winrm_available:
+                print("Danach wird dieser Host auf das gespeicherte PSRP/WinRM HTTPS + Kerberos umgestellt.")
+            else:
+                print("! Für diesen PC ist kein geprüfter PSRP/WinRM-Ersatzweg gespeichert.")
+                print("! Der Mavi-Key wird bei Bestätigung trotzdem entfernt; das Inventory bleibt auf SSH.")
+        question = (
+            "Mavi SSH-Key(s) trotz fehlendem Ersatzweg wirklich entfernen?"
+            if connection_before == "SSH" and not saved_winrm_available
+            else "Mavi SSH-Key(s) auf diesem PC wirklich entfernen?"
+        )
+        if not yes_no(question, default=False):
             print("Abgebrochen.")
             return
 
@@ -19189,7 +19198,7 @@ def cmd_ssh_remove_keys(args: argparse.Namespace) -> None:
         print(f"\n! Key-Entfernung auf {args.host} fehlgeschlagen, Code {rc}.")
         return
 
-    if connection_before == "SSH":
+    if connection_before == "SSH" and saved_winrm_available:
         inv, windows, host_data = _host_inventory_entry(args.project, args.host)
         del windows
         _apply_saved_winrm_https_transport(args.project, host_data)
@@ -19197,6 +19206,8 @@ def cmd_ssh_remove_keys(args: argparse.Namespace) -> None:
         print(f"✓ {args.host}: Mavi SSH-Key(s) entfernt und Inventory auf PSRP HTTPS/Kerberos umgestellt.")
     else:
         print(f"✓ {args.host}: Mavi SSH-Key(s) entfernt. Verbindung bleibt {connection_before}.")
+        if connection_before == "SSH":
+            print("  Für neue Mavi-SSH-Verbindungen muss wieder ein Key eingerichtet oder die Verbindung umgestellt werden.")
 
     print("  OpenSSH/sshd bleibt auf Windows installiert und aktiv.")
     print("  Fremde SSH-Keys und Mavi-known_hosts auf dem Ansible-Server bleiben unangetastet.")
@@ -19230,8 +19241,29 @@ def ssh_remove_keys_menu(project: Path) -> None:
 
             print()
             print(f"! Mavi SSH-Key(s) werden auf {len(hosts)} PC(s) entfernt.")
-            print("! SSH-Keys werden nur entfernt, wenn der sichere PSRP-HTTPS/Kerberos-Weg geprüft ist.")
-            if not yes_no("Wirklich auf ALLEN Inventory-PCs durchführen?", default=False):
+            switch_to_winrm: set[str] = set()
+            ssh_without_replacement: list[str] = []
+            for host in hosts:
+                _, host_windows, host_data = _host_inventory_entry(project, host)
+                if _connection_label(host_windows, host_data) != "SSH":
+                    continue
+                try:
+                    _saved_winrm_https_transport(project, host_data)
+                except ValueError:
+                    ssh_without_replacement.append(host)
+                else:
+                    switch_to_winrm.add(host)
+
+            if ssh_without_replacement:
+                print(
+                    f"! Für {len(ssh_without_replacement)} SSH-PC(s) ist kein geprüfter "
+                    "PSRP/WinRM-Ersatzweg gespeichert: " + ", ".join(ssh_without_replacement)
+                )
+                print("! Bei Bestätigung werden die Mavi-Keys dort trotzdem entfernt; das Inventory bleibt auf SSH.")
+                question = "Mavi SSH-Key(s) trotzdem auf ALLEN Inventory-PCs entfernen?"
+            else:
+                question = "Mavi SSH-Key(s) wirklich auf ALLEN Inventory-PCs entfernen?"
+            if not yes_no(question, default=False):
                 print("Abgebrochen.")
                 return
 
@@ -19243,26 +19275,22 @@ def ssh_remove_keys_menu(project: Path) -> None:
                 before_inv, before_windows, before_data = _host_inventory_entry(project, host)
                 del before_inv
                 connection_before = _connection_label(before_windows, before_data)
-                if connection_before == "SSH":
-                    try:
-                        _saved_winrm_https_transport(project, before_data)
-                    except ValueError as exc:
-                        failed.append(host)
-                        print(f"! {host}: übersprungen – {exc}")
-                        continue
                 rc = _remove_mavi_ssh_keys_from_host(project, host)
                 if rc != 0:
                     failed.append(host)
                     print(f"! {host}: fehlgeschlagen, Verbindung bleibt {connection_before}.")
                     continue
 
-                if connection_before == "SSH":
+                if host in switch_to_winrm:
                     after_inv, after_windows, after_data = _host_inventory_entry(project, host)
                     del after_windows
                     _apply_saved_winrm_https_transport(project, after_data)
                     atomic_write_yaml(project_paths(project)["inventory"], after_inv)
                 succeeded.append(host)
-                print(f"✓ {host}: fertig" + (" → PSRP HTTPS/Kerberos" if connection_before == "SSH" else ""))
+                if host in switch_to_winrm:
+                    print(f"✓ {host}: Key(s) entfernt → PSRP HTTPS/Kerberos")
+                else:
+                    print(f"✓ {host}: Key(s) entfernt, Verbindung bleibt {connection_before}")
 
             print()
             print("Mavi SSH-KEY-ENTFERNUNG FERTIG")
@@ -23216,7 +23244,7 @@ Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im int
 
     p_sr = ssh_sub.add_parser(
         "remove-keys",
-        help="Mavi-Public-Key(s) entfernen und SSH-Host nur auf geprüftes PSRP HTTPS/Kerberos umstellen",
+        help="Mavi-Public-Key(s) von einem Windows-PC entfernen",
     )
     p_sr.add_argument("host", help="Inventory-Hostname")
     p_sr.add_argument("-y", "--yes", action="store_true", help="ohne Rückfrage entfernen")
