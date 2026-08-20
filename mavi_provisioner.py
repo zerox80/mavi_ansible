@@ -15248,6 +15248,90 @@ def _acquire_vault_kerberos_ticket(
         raise
 
 
+def _kerberos_cache_connection_overrides() -> dict[str, str]:
+    """PSRP auf die Default-Credential des privaten Kerberos-Caches festlegen."""
+    return {
+        "ansible_user": "",
+        "ansible_psrp_user": "",
+        "ansible_password": "",
+        "ansible_psrp_password": "",
+        "ansible_winrm_pass": "",
+        "ansible_winrm_password": "",
+    }
+
+
+def _ansible_command_with_kerberos_cache(
+    command: list[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Cache-only-Credentials mit höchster Ansible-Variablenpriorität setzen."""
+    if not enabled:
+        return command
+    return [
+        *command,
+        "--extra-vars",
+        json.dumps(
+            _kerberos_cache_connection_overrides(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    ]
+
+
+def _prepare_client_runner_runtime(
+    project: Path,
+    *,
+    host: str,
+    vault_password_file: Path,
+) -> tuple[dict[str, str], Path | None, Path | None]:
+    """Den normalen Client-Runner an den bewährten privaten CCache binden."""
+    _inventory, windows, host_data = _host_inventory_entry(project, host)
+    connection = str(
+        _effective_host_var(windows, host_data, "ansible_connection", "") or ""
+    ).strip().lower()
+    if connection != "psrp":
+        return os.environ.copy(), None, None
+
+    protocol = str(
+        _effective_host_var(windows, host_data, "ansible_psrp_protocol", "") or ""
+    ).strip().lower()
+    auth = str(
+        _effective_host_var(windows, host_data, "ansible_psrp_auth", "") or ""
+    ).strip().lower()
+    if auth != "kerberos":
+        return os.environ.copy(), None, None
+    if protocol != "https":
+        raise RuntimeError(
+            "Der Client-Runner verwendet PSRP/Kerberos nur mit dem gespeicherten HTTPS-Endpunkt."
+        )
+
+    _ansible_executable, ansible_python = _ansible_playbook_runtime()
+    runtime_environment = _ansible_runtime_environment(ansible_python)
+    _settings, fqdn, _ca_cert, kerberos_principal = _saved_winrm_https_transport(
+        project,
+        host_data,
+    )
+    cache_directory, cache_path, cache_principal = _acquire_vault_kerberos_ticket(
+        project,
+        host=host,
+        vault_password_file=vault_password_file,
+        kerberos_principal=kerberos_principal,
+        ansible_python=ansible_python,
+        target_fqdn=fqdn,
+    )
+    try:
+        runtime_environment["KRB5CCNAME"] = f"FILE:{cache_path}"
+        print(
+            f"  ✓ Client-Runner nutzt privaten Kerberos-Cache: {cache_principal}; "
+            f"host/{fqdn} ist bestätigt."
+        )
+        return runtime_environment, cache_directory, cache_path
+    except BaseException:
+        _discard_kerberos_ticket_cache(cache_directory, cache_path)
+        raise
+
+
 def _run_winrm_temporary_play(
     project: Path,
     *,
@@ -15296,14 +15380,7 @@ def _run_winrm_temporary_play(
             # kein Fallback: Sie zwingen ausschließlich den vorher geprüften
             # Standard-CCache; weder Passwort noch NTLM stehen diesem Proof
             # zur Verfügung.
-            effective_extra_vars.update({
-                "ansible_user": "",
-                "ansible_psrp_user": "",
-                "ansible_password": "",
-                "ansible_psrp_password": "",
-                "ansible_winrm_pass": "",
-                "ansible_winrm_password": "",
-            })
+            effective_extra_vars.update(_kerberos_cache_connection_overrides())
             print(
                 f"  ✓ Privater Kerberos-Cache: {cache_principal}; "
                 f"host/{kerberos_target_fqdn} ist bestätigt."
@@ -20263,6 +20340,8 @@ def run_remote_live_probe(
     app: dict[str, Any],
     vault_password_file: Path,
     timeout: float = 12.0,
+    runtime_environment: dict[str, str] | None = None,
+    kerberos_cache_only: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
     Zweite kurze Ansible-Verbindung während der Hauptinstallation.
@@ -20317,6 +20396,10 @@ def run_remote_live_probe(
             "-e",
             json.dumps(extra, ensure_ascii=False),
         ]
+        cmd = _ansible_command_with_kerberos_cache(
+            cmd,
+            enabled=kerberos_cache_only,
+        )
 
         try:
             result = subprocess.run(
@@ -20325,6 +20408,7 @@ def run_remote_live_probe(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=runtime_environment,
             )
         except subprocess.TimeoutExpired:
             return (
@@ -20390,6 +20474,8 @@ def run_install_subprocess(
     status_interval: float = 10.0,
     vault_password_file: Path | None = None,
     live_probe: bool = True,
+    runtime_environment: dict[str, str] | None = None,
+    kerberos_cache_only: bool = False,
 ) -> int:
     """
     Ansible-Ausgabe live durchreichen.
@@ -20403,11 +20489,15 @@ def run_install_subprocess(
     - KEIN automatischer Abbruch
     - KEINE manuellen Befehle auf dem Ziel-PC
     """
+    cmd = _ansible_command_with_kerberos_cache(
+        cmd,
+        enabled=kerberos_cache_only,
+    )
     shown_command = " ".join(shlex_quote(x) for x in cmd)
     print("\n→ " + redact_sensitive_text(shown_command))
     print()
 
-    env = os.environ.copy()
+    env = (runtime_environment or os.environ).copy()
     # Hilft Python-basierten Child-Prozessen, Ausgaben zeitnah zu flushen.
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -20511,6 +20601,8 @@ def run_install_subprocess(
                             host=host,
                             app=app,
                             vault_password_file=vault_password_file,
+                            runtime_environment=runtime_environment,
+                            kerberos_cache_only=kerberos_cache_only,
                         )
 
                         if probe is not None:
@@ -20694,6 +20786,8 @@ def wait_for_post_install_settle(
     baseline_pids: set[int],
     max_wait_seconds: float = 90.0,
     poll_seconds: float = 5.0,
+    runtime_environment: dict[str, str] | None = None,
+    kerberos_cache_only: bool = False,
 ) -> tuple[bool, str]:
     """
     Verhindert, dass bei einer Katalogserie das nächste Paket startet,
@@ -20710,6 +20804,8 @@ def wait_for_post_install_settle(
             app=app,
             vault_password_file=vault_password_file,
             timeout=12.0,
+            runtime_environment=runtime_environment,
+            kerberos_cache_only=kerberos_cache_only,
         )
 
         if probe is None:
@@ -20757,6 +20853,8 @@ def wait_for_host_ready(
     host: str,
     vault_password_file: Path,
     max_wait_seconds: float = 180.0,
+    runtime_environment: dict[str, str] | None = None,
+    kerberos_cache_only: bool = False,
 ) -> bool:
     """
     Vor dem nächsten Paket kurz win_ping prüfen. Wenn ein vorheriger Installer
@@ -20776,6 +20874,10 @@ def wait_for_host_ready(
             "--vault-password-file",
             str(vault_password_file),
         ]
+        cmd = _ansible_command_with_kerberos_cache(
+            cmd,
+            enabled=kerberos_cache_only,
+        )
 
         try:
             result = subprocess.run(
@@ -20784,6 +20886,7 @@ def wait_for_host_ready(
                 capture_output=True,
                 text=True,
                 timeout=20.0,
+                env=runtime_environment,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             result = None
@@ -20849,6 +20952,8 @@ def precheck_installed_apps(
     selected_keys: list[str],
     vault_password_file: Path,
     timeout: float = 45.0,
+    runtime_environment: dict[str, str] | None = None,
+    kerberos_cache_only: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     # Sicherer Precheck vor "Alle Programme".
     #
@@ -21220,6 +21325,10 @@ $Ansible.Changed = $false
             "--vault-password-file",
             str(vault_password_file),
         ]
+        cmd = _ansible_command_with_kerberos_cache(
+            cmd,
+            enabled=kerberos_cache_only,
+        )
 
         try:
             completed = subprocess.run(
@@ -21228,6 +21337,7 @@ $Ansible.Changed = $false
                 capture_output=True,
                 text=True,
                 timeout=max(5.0, timeout),
+                env=runtime_environment,
             )
         except subprocess.TimeoutExpired:
             return {}, (
@@ -21461,8 +21571,23 @@ def cmd_install(args: argparse.Namespace) -> None:
     results: list[dict[str, Any]] = []
 
     installed_precheck: dict[str, dict[str, Any]] = {}
+    client_runtime_environment: dict[str, str] | None = None
+    kerberos_ticket_directory: Path | None = None
+    kerberos_ticket_path: Path | None = None
+    kerberos_cache_only = False
 
     try:
+        (
+            client_runtime_environment,
+            kerberos_ticket_directory,
+            kerberos_ticket_path,
+        ) = _prepare_client_runner_runtime(
+            args.project,
+            host=args.host,
+            vault_password_file=vault_password_file,
+        )
+        kerberos_cache_only = kerberos_ticket_path is not None
+
         if args.all and not args.check:
             print()
             print("[Mavi SMART] Prüfe zuerst, welche Programme bereits installiert sind ...")
@@ -21474,6 +21599,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                 selected_keys=selected_keys,
                 vault_password_file=vault_password_file,
                 timeout=45.0,
+                runtime_environment=client_runtime_environment,
+                kerberos_cache_only=kerberos_cache_only,
             )
 
             if precheck_error:
@@ -21501,6 +21628,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                     host=args.host,
                     vault_password_file=vault_password_file,
                     max_wait_seconds=180.0,
+                    runtime_environment=client_runtime_environment,
+                    kerberos_cache_only=kerberos_cache_only,
                 ):
                     print()
                     print("[Mavi SMART] Ziel-PC ist nach 180s nicht erreichbar.")
@@ -21548,6 +21677,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                     app=app,
                     vault_password_file=vault_password_file,
                     timeout=12.0,
+                    runtime_environment=client_runtime_environment,
+                    kerberos_cache_only=kerberos_cache_only,
                 )
 
                 if baseline_probe is not None:
@@ -21607,6 +21738,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                 status_interval=status_interval,
                 vault_password_file=vault_password_file,
                 live_probe=live_probe_enabled,
+                runtime_environment=client_runtime_environment,
+                kerberos_cache_only=kerberos_cache_only,
             )
 
             if return_code == 130:
@@ -21633,6 +21766,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                     baseline_pids=baseline_pids,
                     max_wait_seconds=90.0,
                     poll_seconds=5.0,
+                    runtime_environment=client_runtime_environment,
+                    kerberos_cache_only=kerberos_cache_only,
                 )
 
                 if not settle_ok:
@@ -21655,6 +21790,11 @@ def cmd_install(args: argparse.Namespace) -> None:
                 )
 
     finally:
+        if kerberos_ticket_directory is not None and kerberos_ticket_path is not None:
+            _discard_kerberos_ticket_cache(
+                kerberos_ticket_directory,
+                kerberos_ticket_path,
+            )
         vault_password_file.unlink(missing_ok=True)
 
     print()
