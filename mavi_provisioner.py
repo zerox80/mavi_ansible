@@ -7,6 +7,15 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.4 adds a repeatable WinRM/Kerberos reset over the existing OpenSSH key.
+It removes all WinRM listeners, Mavi WinRM firewall rules, certificates,
+policy values and working files from the selected Windows endpoint, then
+stops and disables WinRM. OpenSSH can remain available for immediate
+re-provisioning or be disabled as the final delayed remote step together
+with the current environment's Mavi key and firewall rule. Host-specific
+WinRM state and issued certificates are removed from the controller while
+the shared Mavi WinRM CA remains available for other endpoints.
+
 v0.9.3 makes the fail-closed Windows TCP/22 firewall audit application- and
 service-aware. Program-specific rules such as FortiClient.exe no longer count
 as SSH bypasses, while unbound rules and rules that can apply to sshd still
@@ -60,7 +69,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 # Ein neues Projekt wird bewusst außerhalb des Quell-Repositorys angelegt.
 # So bleiben Umgebungswerte, Inventories, Zertifikate und Secrets getrennt
 # vom veröffentlichbaren Programmcode.
@@ -13783,6 +13792,7 @@ def _apply_ssh_transport(
         f"-o UserKnownHostsFile={shlex_quote(str(known_hosts))} "
         "-o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
     )
+    host_data.pop("mavi_remote_management_disabled", None)
     return resolved_key, resolved_port
 
 
@@ -13849,6 +13859,7 @@ def _apply_psrp_https_transport(
     _clear_host_transport_vars(host_data)
     host_data.update(preserved_credentials)
     host_data.update(_psrp_https_inventory_vars(settings, fqdn=fqdn, ca_cert=ca_cert))
+    host_data.pop("mavi_remote_management_disabled", None)
     if kerberos_principal:
         host_data["ansible_user"] = kerberos_principal
 
@@ -14621,6 +14632,74 @@ def _issue_winrm_server_certificate(
         "cert_sha256": _sha256_file(cert_der).lower(),
         "request_id": request_id,
     }
+
+
+def _remove_host_winrm_certificate_artifacts(
+    project: Path,
+    host: str,
+) -> tuple[int, list[str]]:
+    """Nur die eindeutig diesem Host zugeordneten WinRM-PKI-Dateien löschen."""
+    paths = _winrm_pki_paths(project)
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(host or "WINDOWS")).strip("._-") or "WINDOWS"
+    escaped_host = re.escape(safe_host)
+    file_patterns = {
+        "requests": re.compile(rf"^{escaped_host}-[a-f0-9]{{24}}\.csr\.pem$"),
+        "profiles": re.compile(rf"^{escaped_host}-[a-f0-9]{{24}}\.cnf$"),
+        "certs": re.compile(
+            rf"^(?:{escaped_host}-[a-f0-9]{{24}}\.(?:cert\.pem|cer)|"
+            rf"\.{escaped_host}-[a-f0-9]{{24}}\.cert\.new)$"
+        ),
+    }
+    removed = 0
+    warnings: list[str] = []
+    if paths["root"].is_symlink():
+        warnings.append(f"Verknüpfte WinRM-PKI-Basis wurde nicht bereinigt: {paths['root']}")
+        return removed, warnings
+    try:
+        expected_root = paths["root"].resolve(strict=True)
+    except OSError as exc:
+        if paths["root"].exists():
+            warnings.append(f"WinRM-PKI-Basis konnte nicht geprüft werden: {redact_sensitive_text(exc)}")
+        return removed, warnings
+
+    for directory_key, filename_pattern in file_patterns.items():
+        directory = paths[directory_key]
+        if not directory.exists():
+            continue
+        if directory.is_symlink():
+            warnings.append(f"Verknüpfter WinRM-PKI-Ordner wurde nicht bereinigt: {directory}")
+            continue
+        try:
+            resolved_directory = directory.resolve(strict=True)
+            if resolved_directory.parent != expected_root:
+                warnings.append(
+                    f"Unerwarteter WinRM-PKI-Pfad wurde nicht bereinigt: {resolved_directory}"
+                )
+                continue
+            candidates = list(directory.iterdir())
+        except OSError as exc:
+            warnings.append(
+                f"WinRM-PKI-Ordner {directory} konnte nicht gelesen werden: "
+                f"{redact_sensitive_text(exc)}"
+            )
+            continue
+
+        for candidate in candidates:
+            if filename_pattern.fullmatch(candidate.name) is None:
+                continue
+            try:
+                if candidate.is_dir() and not candidate.is_symlink():
+                    warnings.append(f"Unerwarteter Ordner wurde nicht entfernt: {candidate}")
+                    continue
+                candidate.unlink()
+                removed += 1
+            except OSError as exc:
+                warnings.append(
+                    f"Hostbezogene WinRM-PKI-Datei {candidate} konnte nicht entfernt werden: "
+                    f"{redact_sensitive_text(exc)}"
+                )
+
+    return removed, warnings
 
 
 def _absolute_without_symlink(path: Path) -> Path:
@@ -16033,6 +16112,293 @@ $Ansible.Changed = ($httpListeners.Count -gt 0)
                 "ansible.windows.win_powershell": {
                     "error_action": "stop",
                     "script": powershell,
+                },
+            },
+        ],
+    }]
+
+
+def _winrm_reset_play(
+    *,
+    root_thumbprint: str,
+    disable_openssh: bool = False,
+    public_key_prefix: str = "",
+    key_marker: str = "",
+    openssh_firewall_rule: str = "",
+) -> list[dict[str, Any]]:
+    """Mavi-WinRM über den unabhängigen OpenSSH-Kanal auf Stand 0 setzen."""
+    powershell = r'''[CmdletBinding()]
+param(
+    [string]$RootThumbprint = '',
+    [int]$DisableOpenSshValue = 0,
+    [string]$CurrentKeyPrefix = '',
+    [string]$CurrentKeyMarker = '',
+    [string]$OpenSshFirewallRuleName = ''
+)
+
+$ErrorActionPreference = 'Stop'
+$disableOpenSsh = ($DisableOpenSshValue -eq 1)
+$RootThumbprint = ($RootThumbprint -replace '\s', '').ToUpperInvariant()
+if (-not [string]::IsNullOrWhiteSpace($RootThumbprint) -and $RootThumbprint -notmatch '^[A-F0-9]{40}$') {
+    throw 'Mavi WinRM Reset: Der Root-CA-Fingerabdruck ist ungültig.'
+}
+if ($disableOpenSsh -and $OpenSshFirewallRuleName -notmatch '^[A-Za-z0-9_.-]{1,255}$') {
+    throw 'Mavi Remote-Aus: Der Name der OpenSSH-Firewallregel ist ungültig.'
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Mavi WinRM Reset benötigt einen erhöhten lokalen Administrator-Token; aktuell: $($identity.Name)"
+}
+
+$policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+$policyNames = @(
+    'AllowUnencryptedTraffic',
+    'AllowKerberos',
+    'AllowNegotiate',
+    'AllowBasic',
+    'AllowCredSSP'
+)
+$firewallNames = @(
+    'Mavi-WinRM-HTTPS-Ansible-In-TCP',
+    'Mavi-WinRM-HTTP-Dauerhaft-Block-TCP',
+    'Mavi-WinRM-HTTPS-Setup-Isolation-TCP'
+)
+$workDirectory = Join-Path $env:ProgramData 'Mavi\WinRM-TLS'
+$removedListeners = 0
+$removedCertificates = 0
+$removedFirewallRules = 0
+$removedOpenSshKeys = 0
+$openSshDisableScheduled = $false
+$cleanupError = $null
+
+try {
+    # Ein Mavi-Endzustand blockiert Negotiate per Richtlinie. Für die lokale
+    # WSMan:-Verwaltung über die unabhängige SSH-Sitzung wird es kurz aktiviert.
+    New-Item -Path $policyPath -Force | Out-Null
+    Set-ItemProperty -Path $policyPath -Name AllowNegotiate -Type DWord -Value 1 -Force
+    Set-Service -Name WinRM -StartupType Manual -ErrorAction Stop
+    Start-Service -Name WinRM -ErrorAction SilentlyContinue
+    Restart-Service -Name WinRM -Force -ErrorAction Stop
+
+    Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $false -Force -ErrorAction Stop
+    Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $false -Force -ErrorAction Stop
+    Set-Item -Path WSMan:\localhost\Service\Auth\Kerberos -Value $true -Force -ErrorAction Stop
+    Set-Item -Path WSMan:\localhost\Service\Auth\Negotiate -Value $true -Force -ErrorAction Stop
+    Set-Item -Path WSMan:\localhost\Service\Auth\Certificate -Value $false -Force -ErrorAction Stop
+    Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $false -Force -ErrorAction Stop
+
+    $listeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
+    foreach ($listener in $listeners) {
+        Remove-Item -LiteralPath $listener.PSPath -Recurse -Force -ErrorAction Stop
+        $removedListeners++
+    }
+
+    foreach ($name in $firewallNames) {
+        $rules = @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)
+        foreach ($rule in $rules) {
+            Remove-NetFirewallRule -InputObject $rule -ErrorAction Stop
+            $removedFirewallRules++
+        }
+    }
+
+    $effectiveRootThumbprint = $RootThumbprint
+    $remoteRootPath = Join-Path $workDirectory 'mavi-winrm-root-ca.cer'
+    if ([string]::IsNullOrWhiteSpace($effectiveRootThumbprint) -and (Test-Path -LiteralPath $remoteRootPath -PathType Leaf)) {
+        $remoteRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($remoteRootPath)
+        $effectiveRootThumbprint = ([string]$remoteRoot.Thumbprint).ToUpperInvariant()
+    }
+
+    $rootSubject = ''
+    if ($effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
+        $rootCertificate = Get-Item -LiteralPath ("Cert:\LocalMachine\Root\$effectiveRootThumbprint") -ErrorAction SilentlyContinue
+        if ($null -ne $rootCertificate) {
+            $rootSubject = [string]$rootCertificate.Subject
+        }
+    }
+
+    foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
+        if (-not (Test-Path -LiteralPath $storePath)) { continue }
+        foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction SilentlyContinue)) {
+            $isMaviLeaf = ([string]$certificate.FriendlyName) -like 'Mavi WinRM HTTPS *'
+            if (-not [string]::IsNullOrWhiteSpace($rootSubject)) {
+                $isMaviLeaf = $isMaviLeaf -or ([string]$certificate.Issuer).Equals(
+                    $rootSubject,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+            if ($isMaviLeaf) {
+                Remove-Item -LiteralPath $certificate.PSPath -Force -ErrorAction Stop
+                $removedCertificates++
+            }
+        }
+    }
+
+    if ($effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
+        $rootPath = "Cert:\LocalMachine\Root\$effectiveRootThumbprint"
+        if (Test-Path -LiteralPath $rootPath) {
+            Remove-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            $removedCertificates++
+        }
+    }
+
+    if (Test-Path -LiteralPath $workDirectory) {
+        Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction Stop
+    }
+}
+catch {
+    $cleanupError = $_.Exception.Message
+}
+finally {
+    if (Test-Path -LiteralPath $policyPath) {
+        foreach ($name in $policyNames) {
+            Remove-ItemProperty -LiteralPath $policyPath -Name $name -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Stop-Service -Name WinRM -Force -ErrorAction SilentlyContinue
+    Set-Service -Name WinRM -StartupType Disabled -ErrorAction Stop
+}
+
+if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
+    throw "Mavi WinRM Reset wurde nicht vollständig ausgeführt: $cleanupError"
+}
+
+$remainingListeners = 0
+try {
+    $remainingListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop).Count
+}
+catch {
+    # Der Dienst ist jetzt absichtlich deaktiviert. Die zuvor erfolgreiche
+    # Entfernung ist der maßgebliche Listener-Nachweis.
+    $remainingListeners = 0
+}
+$service = Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction Stop
+if ($remainingListeners -ne 0 -or [string]$service.State -ne 'Stopped' -or [string]$service.StartMode -ne 'Disabled') {
+    throw 'Mavi WinRM Reset: Der abschließende Stand-0-Nachweis ist fehlgeschlagen.'
+}
+
+if ($disableOpenSsh) {
+    $sshdService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($null -eq $sshdService) {
+        throw 'Mavi Remote-Aus: Der OpenSSH-Serverdienst sshd wurde nicht gefunden.'
+    }
+
+    # Der laufende SSH-Kanal darf seine Erfolgsmeldung noch zurückgeben. Der
+    # Dienst wird bereits jetzt für jeden Neustart deaktiviert und wenige
+    # Sekunden später durch einen einmaligen SYSTEM-Task gestoppt.
+    Set-Service -Name sshd -StartupType Disabled -ErrorAction Stop
+
+    $keyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    if (Test-Path -LiteralPath $keyFile -PathType Leaf) {
+        $keyLines = @(Get-Content -LiteralPath $keyFile -ErrorAction Stop)
+        $keptKeyLines = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($keyLineObject in $keyLines) {
+            $keyLine = [string]$keyLineObject
+            $trimmedKeyLine = $keyLine.Trim()
+            $isMaviKey = $false
+            if (-not [string]::IsNullOrWhiteSpace($CurrentKeyMarker)) {
+                $markerPattern = '(^|\s)' + [regex]::Escape($CurrentKeyMarker) + '(\s|$)'
+                $isMaviKey = $trimmedKeyLine -match $markerPattern
+            }
+            if (
+                -not $isMaviKey -and
+                -not [string]::IsNullOrWhiteSpace($CurrentKeyPrefix) -and
+                ($trimmedKeyLine -eq $CurrentKeyPrefix -or $trimmedKeyLine.StartsWith($CurrentKeyPrefix + ' '))
+            ) {
+                $isMaviKey = $true
+            }
+            if ($isMaviKey) {
+                $removedOpenSshKeys++
+                continue
+            }
+            $keptKeyLines.Add($keyLine)
+        }
+        if ($removedOpenSshKeys -gt 0) {
+            [System.IO.File]::WriteAllLines(
+                $keyFile,
+                [string[]]$keptKeyLines,
+                [System.Text.Encoding]::ASCII
+            )
+        }
+    }
+
+    $taskName = 'Mavi-Disable-RemoteAccess-' + [Guid]::NewGuid().ToString('N')
+    $childScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+Start-Sleep -Seconds 20
+Get-NetFirewallRule -Name '__MAVI_FIREWALL_RULE_NAME__' -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+Set-Service -Name sshd -StartupType Disabled -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName '__MAVI_TASK_NAME__' -Confirm:$false -ErrorAction SilentlyContinue
+'@
+    $childScript = $childScript.Replace('__MAVI_TASK_NAME__', $taskName)
+    $childScript = $childScript.Replace('__MAVI_FIREWALL_RULE_NAME__', $OpenSshFirewallRuleName)
+    $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $taskAction = New-ScheduledTaskAction `
+        -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $encodedScript"
+    $taskPrincipal = New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+    $taskSettings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $taskAction `
+        -Principal $taskPrincipal `
+        -Settings $taskSettings `
+        -Force | Out-Null
+    $beforeTaskRun = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop).LastRunTime
+    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    $taskStartDeadline = (Get-Date).AddSeconds(6)
+    do {
+        Start-Sleep -Milliseconds 250
+        $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $scheduledTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop
+        if ($scheduledTask.State -eq 'Running' -or $scheduledTaskInfo.LastRunTime -gt $beforeTaskRun) {
+            $openSshDisableScheduled = $true
+            break
+        }
+    } while ((Get-Date) -lt $taskStartDeadline)
+    if (-not $openSshDisableScheduled) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        throw 'Mavi Remote-Aus: Der verzögerte sshd-Stopp konnte nicht gestartet werden.'
+    }
+}
+
+$Ansible.Result = @{
+    RemovedListeners = $removedListeners
+    RemovedCertificates = $removedCertificates
+    RemovedFirewallRules = $removedFirewallRules
+    RemovedOpenSshKeys = $removedOpenSshKeys
+    OpenSshDisableScheduled = $openSshDisableScheduled
+    WinRMState = [string]$service.State
+    WinRMStartMode = [string]$service.StartMode
+}
+$Ansible.Changed = $true
+'''
+    return [{
+        "name": "Mavi WinRM und Kerberos-Transport auf Stand 0 zurücksetzen",
+        "hosts": "windows",
+        "gather_facts": False,
+        "tasks": [
+            {
+                "name": "WinRM-Listener, Mavi-Zertifikate, Regeln und Richtlinien entfernen",
+                "ansible.windows.win_powershell": {
+                    "error_action": "stop",
+                    "script": powershell,
+                    "parameters": {
+                        "RootThumbprint": root_thumbprint,
+                        "DisableOpenSshValue": 1 if disable_openssh else 0,
+                        "CurrentKeyPrefix": public_key_prefix,
+                        "CurrentKeyMarker": key_marker,
+                        "OpenSshFirewallRuleName": openssh_firewall_rule,
+                    },
                 },
             },
         ],
@@ -19050,6 +19416,166 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
     print(f"  SSH:              bleibt installiert und aktiv als separater Verwaltungsweg")
 
 
+def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
+    """WinRM auf Stand 0 setzen und OpenSSH auf Wunsch als letzten Kanal abschalten."""
+    ensure_initialized(args.project, quiet=True)
+    inv, windows, host_data = _host_inventory_entry(args.project, args.host)
+    disable_openssh = bool(getattr(args, "disable_openssh", False))
+    connection = str(
+        _effective_host_var(windows, host_data, "ansible_connection", "") or ""
+    ).lower()
+
+    if not bool(getattr(args, "yes", False)):
+        print("\nMavi REMOTE-VERWALTUNG ZURÜCKSETZEN")
+        print("====================================")
+        print(f"PC:       {args.host}")
+        print("WinRM:    alle Listener, Mavi-Regeln, Mavi-Zertifikate und Richtlinienwerte entfernen")
+        print("           Dienst anschließend stoppen und deaktivieren")
+        if disable_openssh:
+            print("OpenSSH:  Mavi-Key entfernen, Mavi-Firewallregel entfernen, sshd stoppen/deaktivieren")
+            print("! Danach gibt es keinen Mavi-Fernzugang mehr. Neueinrichtung nur lokal per Starter.")
+        else:
+            print("OpenSSH:  bleibt als sofortiger Weg für eine neue WinRM-Einrichtung aktiv")
+        if not yes_no("Diesen Stand-0-Rückbau wirklich ausführen?", default=False):
+            print("Abgebrochen.")
+            return
+
+    requested_key = getattr(args, "key", None)
+    requested_port = getattr(args, "port", None)
+    if connection != "ssh" or requested_key is not None or requested_port is not None:
+        if connection != "ssh":
+            print(f"\n{args.host} wird zuerst über den vorhandenen Mavi-Key auf OpenSSH umgestellt.")
+        cmd_ssh_use(
+            argparse.Namespace(
+                project=args.project,
+                host=args.host,
+                key=requested_key,
+                port=requested_port,
+                yes=bool(getattr(args, "yes", False)),
+            )
+        )
+        inv, windows, host_data = _host_inventory_entry(args.project, args.host)
+
+    reset_public_key_prefix = ""
+    reset_key_marker = ""
+    openssh_firewall_rule = ""
+    if disable_openssh:
+        active_key_raw = str(
+            _effective_host_var(windows, host_data, "ansible_ssh_private_key_file", "") or ""
+        ).strip()
+        if active_key_raw:
+            active_key_path = Path(active_key_raw).expanduser().resolve()
+            active_public_key, _ = _public_key_summary(
+                Path(str(active_key_path) + ".pub")
+            )
+            active_key_parts = active_public_key.split()
+            if len(active_key_parts) >= 2:
+                reset_public_key_prefix = f"{active_key_parts[0]} {active_key_parts[1]}"
+        if not reset_public_key_prefix:
+            reset_public_key_prefix = _mavi_public_key_prefix(args.project)
+        reset_key_marker = _ssh_environment_marker(args.project)
+        openssh_firewall_rule = (
+            f"Mavi-OpenSSH-{_bootstrap_instance_id(args.project)}-Ansible-In-TCP"
+        )
+
+    root_thumbprint = ""
+    ca_der = _winrm_pki_paths(args.project)["ca_der"]
+    if ca_der.is_file():
+        try:
+            root_thumbprint = hashlib.sha1(
+                ca_der.read_bytes(),
+                usedforsecurity=False,
+            ).hexdigest().upper()
+        except (OSError, ValueError) as exc:
+            die(
+                "Der Fingerabdruck der lokalen Mavi-WinRM-CA konnte nicht gelesen werden: "
+                f"{redact_sensitive_text(exc)}"
+            )
+
+    vault_file: Path | None = None
+    vault_password = getpass.getpass("Vault password: ")
+    try:
+        vault_file = create_temporary_vault_password_file(vault_password)
+    except OSError as exc:
+        die(f"Temporäre Vault-Datei konnte nicht sicher angelegt werden: {exc}")
+    finally:
+        vault_password = ""
+
+    try:
+        _run_winrm_temporary_play(
+            args.project,
+            host=args.host,
+            play=_winrm_reset_play(
+                root_thumbprint=root_thumbprint,
+                disable_openssh=disable_openssh,
+                public_key_prefix=reset_public_key_prefix,
+                key_marker=reset_key_marker,
+                openssh_firewall_rule=openssh_firewall_rule,
+            ),
+            vault_password_file=vault_file,
+            description=(
+                "WinRM/Kerberos- und OpenSSH-Rückbau über SSH"
+                if disable_openssh
+                else "WinRM/Kerberos-Stand-0-Rückbau über SSH"
+            ),
+            timeout=180.0,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print("\nFEHLER: Der Remote-Rückbau wurde nicht vollständig bestätigt.")
+        print(redact_sensitive_text(exc))
+        print(f"Der Inventory-Host {args.host} bleibt für die Reparatur auf OpenSSH eingestellt.")
+        raise SystemExit(2)
+    finally:
+        if vault_file is not None:
+            vault_file.unlink(missing_ok=True)
+
+    inv, windows, host_data = _host_inventory_entry(args.project, args.host)
+    current_key_raw = str(
+        _effective_host_var(windows, host_data, "ansible_ssh_private_key_file", "") or ""
+    ).strip()
+    current_port_raw = _effective_host_var(windows, host_data, "ansible_port", None)
+    try:
+        current_port = int(current_port_raw) if current_port_raw is not None else None
+    except (TypeError, ValueError):
+        current_port = None
+    _apply_ssh_transport(
+        args.project,
+        host_data,
+        key_path=Path(current_key_raw).expanduser() if current_key_raw else None,
+        port=current_port,
+    )
+    host_data.pop("mavi_winrm_https", None)
+    host_data.pop("mavi_winrm_fqdn", None)
+    if disable_openssh:
+        host_data["mavi_remote_management_disabled"] = {
+            "version": 1,
+            "winrm": True,
+            "openssh": True,
+        }
+    atomic_write_yaml(project_paths(args.project)["inventory"], inv)
+
+    removed_artifacts, artifact_warnings = _remove_host_winrm_certificate_artifacts(
+        args.project,
+        args.host,
+    )
+
+    print("\n✓ Remote-Verwaltungszustand wurde zurückgesetzt.")
+    print("  WinRM:            Listener entfernt, Dienst gestoppt und deaktiviert")
+    print("  Kerberos/PSRP:    gespeicherter Hoststatus entfernt; kein persistenter Mavi-Ticketcache")
+    print(f"  Host-PKI-Dateien: {removed_artifacts} Datei(en) auf dem Controller entfernt")
+    print("  Gemeinsame CA:    bleibt bestehen, damit andere Windows-PCs weiter funktionieren")
+    if disable_openssh:
+        print("  OpenSSH:          Mavi-Key entfernt; sshd wird verzögert gestoppt und ist deaktiviert")
+        print("  Fernzugang:       vollständig aus; OpenSSH bleibt lediglich installiert")
+        print("\nFür eine spätere Neueinrichtung zuerst den Mavi-OpenSSH-Starter lokal am PC ausführen.")
+        print(f"Danach: mavi-provisioner ssh use {args.host}")
+    else:
+        print("  OpenSSH:          bleibt installiert und aktiv")
+        print(f"\nWinRM neu einrichten mit: mavi-provisioner ssh winrm-https {args.host}")
+    for warning in artifact_warnings:
+        print(f"! {warning}")
+
+
 def cmd_ssh_use_psrp(args: argparse.Namespace) -> None:
     ensure_initialized(args.project, quiet=True)
     inv, windows, host_data = _host_inventory_entry(args.project, args.host)
@@ -19449,7 +19975,13 @@ def cmd_ssh_status(args: argparse.Namespace) -> None:
         print("----")
         print(f"Name:               {host}")
         print(f"IP:                 {host_data.get('ansible_host', '')}")
-        print(f"Verbindung:         {_connection_label(windows, host_data)}")
+        disabled_state = host_data.get("mavi_remote_management_disabled")
+        remote_management_disabled = (
+            isinstance(disabled_state, dict) and disabled_state.get("openssh") is True
+        )
+        if remote_management_disabled:
+            print("Remote-Verwaltung:  AUS — WinRM und OpenSSH wurden vollständig deaktiviert")
+        print(f"Inventory-Eintrag:  {_connection_label(windows, host_data)}")
         print(f"Port:               {_effective_host_var(windows, host_data, 'ansible_port', '')}")
         print(f"Shell:              {_effective_host_var(windows, host_data, 'ansible_shell_type', '(PSRP intern PowerShell)')}")
         print(f"Ansible-User:       {_effective_host_var(windows, host_data, 'ansible_user', '(geerbt)')}")
@@ -19458,8 +19990,11 @@ def cmd_ssh_status(args: argparse.Namespace) -> None:
         target_port = int(_effective_host_var(windows, host_data, "ansible_port", 22) or 22)
         print(f"Host-Key bekannt:   {'✓' if _known_host_present(known_hosts, target_host, target_port) else 'NEIN'}")
         if str(_effective_host_var(windows, host_data, "ansible_connection", "psrp")).lower() == "ssh":
-            key_only = not bool(_effective_host_var(windows, host_data, "ansible_ssh_password", ""))
-            print(f"SSH Key-only:       {'✓' if key_only else '! Passwort ist noch aktiv'}")
+            if remote_management_disabled:
+                print("SSH-Dienst:         laut gespeichertem Stand-0-Status deaktiviert")
+            else:
+                key_only = not bool(_effective_host_var(windows, host_data, "ansible_ssh_password", ""))
+                print(f"SSH Key-only:       {'✓' if key_only else '! Passwort ist noch aktiv'}")
         else:
             protocol = str(_effective_host_var(windows, host_data, "ansible_psrp_protocol", "") or "").lower()
             auth = str(_effective_host_var(windows, host_data, "ansible_psrp_auth", "") or "").lower()
@@ -19487,6 +20022,8 @@ def ssh_menu(project: Path) -> None:
         print("  7) Mavi SSH-Key(s) von Windows-PC(s) entfernen")
         print("  8) nginx/HTTPS/Zertifikat automatisch einrichten oder prüfen")
         print("  9) WinRM über OpenSSH auf HTTPS + Kerberos-only härten")
+        print(" 10) WinRM/Kerberos auf Stand 0 setzen (OpenSSH bleibt aktiv)")
+        print(" 11) WinRM und OpenSSH vollständig deaktivieren")
         print("  0) Zurück")
         print()
         choice = input("> ").strip()
@@ -19520,6 +20057,30 @@ def ssh_menu(project: Path) -> None:
             elif choice == "9":
                 host = choose_host_interactive(project)
                 cmd_ssh_winrm_https(argparse.Namespace(project=project, host=host))
+            elif choice == "10":
+                host = choose_host_interactive(project)
+                cmd_ssh_winrm_reset(
+                    argparse.Namespace(
+                        project=project,
+                        host=host,
+                        key=None,
+                        port=None,
+                        yes=False,
+                        disable_openssh=False,
+                    )
+                )
+            elif choice == "11":
+                host = choose_host_interactive(project)
+                cmd_ssh_winrm_reset(
+                    argparse.Namespace(
+                        project=project,
+                        host=host,
+                        key=None,
+                        port=None,
+                        yes=False,
+                        disable_openssh=True,
+                    )
+                )
             elif choice == "0":
                 return
             else:
@@ -22661,6 +23222,8 @@ Beispiele:
   mavi-provisioner ssh use PC-001
   mavi-provisioner ssh status PC-001
   mavi-provisioner ssh psrp PC-001
+  mavi-provisioner ssh winrm-reset PC-001
+  mavi-provisioner ssh winrm-reset PC-001 --disable-openssh
 
 Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im interaktiven Menü können PCs, Kataloge und Programme bequem per Nummer gewählt werden. Unter 'Kataloge verwalten' lassen sich bestehende Programme schnell bearbeiten, anzeigen, kopieren und entfernen. Strg+2 wechselt in unterstützten Programmauswahlen direkt in den Mehrfachmodus.
 """,
@@ -23373,6 +23936,27 @@ Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im int
     )
     p_swh.add_argument("host", help="Inventory-Hostname mit eingerichteter OpenSSH-Key-Verbindung")
     p_swh.set_defaults(func=cmd_ssh_winrm_https)
+
+    p_swr = ssh_sub.add_parser(
+        "winrm-reset",
+        aliases=["winrm-disable"],
+        help="WinRM/Kerberos über OpenSSH vollständig auf Stand 0 zurücksetzen",
+    )
+    p_swr.add_argument("host", help="Inventory-Hostname; OpenSSH muss auf Windows erreichbar sein")
+    p_swr.add_argument("--key", help="Alternativer privater SSH-Key für den Rückbau")
+    p_swr.add_argument("--port", type=int, help="SSH-Port für den Rückbau; Standard aus der Konfiguration")
+    p_swr.add_argument(
+        "--disable-openssh",
+        action="store_true",
+        help="nach dem WinRM-Rückbau auch Mavi-SSH-Key/Firewall entfernen und sshd deaktivieren",
+    )
+    p_swr.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Stand-0-Rückbau ohne Bestätigungsfrage starten",
+    )
+    p_swr.set_defaults(func=cmd_ssh_winrm_reset)
 
     p_ss = ssh_sub.add_parser(
         "status",

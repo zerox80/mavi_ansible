@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.4-oss
+
+- Wiederholbaren WinRM/Kerberos-Stand-0-Rückbau über den bestehenden OpenSSH-Kanal ergänzt.
+- Optionales vollständiges Abschalten des Mavi-Fernzugangs mit Entfernung des umgebungseigenen SSH-Keys und der OpenSSH-Firewallregel sowie verzögertem Stoppen von `sshd` ergänzt.
+- Hostbezogenen WinRM-Inventory-Status und ausgestellte Hostzertifikate nach erfolgreichem Rückbau bereinigt; die gemeinsame WinRM-CA bleibt für andere PCs erhalten.
+- Neue TUI-Aktionen und `ssh winrm-reset [--disable-openssh]` ergänzt.
+
 ## 0.9.3-oss
 
 - Erstes Mavi-Provisioner-OSS-Releasekandidatenlayout.
