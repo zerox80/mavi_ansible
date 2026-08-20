@@ -39,8 +39,8 @@ nicht-geheimen Werte ab:
 
 Der vorgeschlagene Softwareordner liegt im Laufzeitprojekt und wird leer
 angelegt. Das ist der beste Start für ein Labor oder einen ersten PC. Einen
-vorhandenen Mount oder Share kann man jederzeit über `setup --advanced`
-ersetzen.
+vorhandenen Mount oder Share kann man jederzeit über **Grundprofil &
+Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** ersetzen.
 
 Die AD-DNS-Domäne ist nur für den späteren Kerberos-/WinRM-Weg nötig. Sie kann
 im Schnellstart übersprungen werden.
@@ -92,8 +92,8 @@ verwendet.
 
 | Bedarf | Nächster Schritt |
 | --- | --- |
-| Software liegt auf SMB/UNC | `python3 mavi_provisioner.py setup --advanced` |
-| Windows-Laufwerk abbilden | `setup --advanced` und Laufwerk/UNC angeben |
+| Software liegt auf SMB/UNC | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** |
+| Windows-Laufwerk abbilden | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** |
 | AD-Domäne/WinRM-Kerberos | AD-DNS-Domäne im Setup setzen, danach Doctor → WinRM prüfen |
 | DC, DNS, DHCP, Netzlaufwerke oder CA inventarisieren | Doctor → Offline-Collector oder Remote-Doctor |
 | OpenSSH bereitstellen | PCs & Verbindung → OpenSSH / Windows-Verbindung |

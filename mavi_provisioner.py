@@ -5251,14 +5251,15 @@ def normalize_path(raw: str, config: dict[str, Any]) -> Path:
             return root
         die(
             f"Für das Laufwerk {requested_drive} ist kein lokales Mapping "
-            "konfiguriert.\nBitte zuerst im Mavi-Setup die Softwarequelle "
-            "einrichten."
+            "konfiguriert.\nBitte in der TUI Grundprofil & Softwarequelle -> "
+            "Softwarequelle, UNC und Laufwerk einrichten öffnen."
         )
 
     if raw.startswith("\\\\"):
         die(
             f"Für diesen UNC-Pfad ist kein Mapping konfiguriert: {raw}\n"
-            "Bitte software/mavi_config.yml -> path_mappings ergänzen."
+            "Bitte in der TUI Grundprofil & Softwarequelle -> "
+            "Softwarequelle, UNC und Laufwerk einrichten öffnen."
         )
 
     return Path(raw)
@@ -21727,6 +21728,136 @@ def legacy_menu(project: Path) -> None:
             print()
             return
 
+def mavi_software_source_setup(project: Path) -> None:
+    """Softwarequelle und Windows-Pfadabbildungen vollständig in der TUI pflegen."""
+    ensure_initialized(project, quiet=True)
+    config = get_config(project)
+    source = dict(config.get("software_source", {}) or {})
+    old_source = dict(source)
+
+    print()
+    print("SOFTWAREQUELLE EINRICHTEN")
+    print("=========================")
+
+    source["label"] = prompt(
+        "Bezeichnung",
+        str(source.get("label", "") or "").strip() or "Softwarequelle",
+    ).strip() or "Softwarequelle"
+
+    source_root = _mavi_prompt_source_root(
+        str(source.get("local_root", "") or "").strip()
+        or str(project / "software-source")
+    )
+    source["local_root"] = source_root
+    if source_root:
+        try:
+            Path(source_root).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"! Software-Ordner konnte nicht automatisch angelegt werden: {exc}")
+
+    source_kind = prompt_choice(
+        "Wie liegt die Softwarequelle auf dem Controller vor?",
+        [
+            ("1", "Lokaler oder gemounteter Ordner"),
+            ("2", "SMB/UNC-Quelle, die auf dem Controller gemountet ist"),
+        ],
+        "2" if str(source.get("kind", "") or "").lower() == "smb" else "1",
+    )
+    source["kind"] = "smb" if source_kind == "2" else "local"
+
+    if yes_no(
+        "Windows-Laufwerksbuchstabe für diese Quelle hinterlegen?",
+        bool(_mavi_drive_label(source.get("drive"))),
+    ):
+        while True:
+            drive = _mavi_drive_label(prompt(
+                "Laufwerk (z. B. S:)",
+                _mavi_drive_label(source.get("drive")) or "S:\\",
+            ))
+            if re.fullmatch(r"[A-Z]:\\", drive):
+                source["drive"] = drive
+                break
+            print("! Bitte nur einen Laufwerksbuchstaben wie S: eingeben.")
+    else:
+        source["drive"] = ""
+
+    if source["kind"] == "smb":
+        source["unc_root"] = prompt(
+            "UNC-Wurzel (z. B. \\\\server\\freigabe)",
+            str(source.get("unc_root", "") or "").strip(),
+        ).strip().rstrip("\\/")
+    else:
+        source["unc_root"] = ""
+
+    mappings = dict(config.get("path_mappings", {}) or {})
+    for old_key in (
+        _mavi_drive_label(old_source.get("drive")),
+        _mavi_drive_label(old_source.get("drive"))[:2],
+        str(old_source.get("unc_root", "") or "").strip().rstrip("\\/"),
+    ):
+        if old_key:
+            mappings.pop(old_key, None)
+
+    drive = _mavi_drive_label(source.get("drive"))
+    if drive and source_root:
+        mappings[drive] = source_root
+        mappings[drive[:2]] = source_root
+    unc_root = str(source.get("unc_root", "") or "").strip().rstrip("\\/")
+    if unc_root and source_root:
+        mappings[unc_root] = source_root
+
+    config["software_source"] = source
+    config["path_mappings"] = mappings
+    config["profile"]["setup_completed"] = not _mavi_profile_validation_issues(config)
+    _mavi_write_config(project, config)
+
+    print()
+    print("✓ Softwarequelle gespeichert.")
+    print(f"  UNC:            {unc_root or '(keine)'}")
+    print(f"  Auf Controller: {source_root}")
+
+
+def mavi_setup_menu(project: Path) -> None:
+    """TUI-Einstieg für Grundprofil und erweiterte Softwarequellen."""
+    while True:
+        config = get_config(project)
+        source = config.get("software_source", {}) or {}
+        local_root = str(source.get("local_root", "") or "").strip()
+        unc_root = str(source.get("unc_root", "") or "").strip()
+        drive = _mavi_drive_label(source.get("drive"))
+
+        print()
+        print("GRUNDPROFIL & SOFTWAREQUELLE")
+        print("============================")
+        print(f"  Controller-Pfad:  {local_root or '(noch nicht gesetzt)'}")
+        print(f"  UNC-Wurzel:       {unc_root or '(keine)'}")
+        print(f"  Windows-Laufwerk: {drive or '(keins)'}")
+        print()
+        print("  1) Grundprofil bearbeiten")
+        print("  2) Softwarequelle, UNC und Laufwerk einrichten")
+        print("  0) Zurück")
+        print()
+        choice = input("> ").strip()
+
+        try:
+            if choice == "1":
+                cmd_setup(argparse.Namespace(project=project, advanced=False))
+            elif choice == "2":
+                mavi_software_source_setup(project)
+            elif choice == "0":
+                return
+            else:
+                print("Ungültige Auswahl.")
+        except KeyboardInterrupt:
+            print("\nAbgebrochen.")
+        except EOFError:
+            print()
+            return
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print(f"\nAktion beendet mit Code {exc.code}.")
+
+
 def mavi_doctor_menu(project: Path) -> None:
     """TUI-Frontend für den read-only Doctor."""
     while True:
@@ -21984,7 +22115,7 @@ def menu(project: Path) -> None:
             "╚══════════════════════════════════════╝\n"
             f" Umgebung: {profile_name or '(noch nicht benannt)'}  |  {setup_state}\n"
             "\n"
-            "  1) Schnellstart / Grundprofil\n"
+            "  1) Grundprofil & Softwarequelle\n"
             "  2) Zugangsdaten & Vault\n"
             "  3) Doctor & Bereitschaft\n"
             "  4) PCs & Verbindung\n"
@@ -21997,7 +22128,7 @@ def menu(project: Path) -> None:
         choice = input("> ").strip()
         try:
             if choice == "1":
-                cmd_setup(argparse.Namespace(project=project, advanced=False))
+                mavi_setup_menu(project)
             elif choice == "2":
                 mavi_credentials_menu(project)
             elif choice == "3":

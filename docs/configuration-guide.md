@@ -14,7 +14,7 @@ Zertifizierungsstelle vollständig kennen zu müssen.
 | AD-DNS-Domäne | DNS-Suffix der AD-Domäne, z. B. `ad.example.org` | `winrm_https.domain_suffix` |
 | DCs/DNS/Kerberos/LDAP | Doctor-Collector auf einem Domänen-PC oder Remote-Doctor | JSON-Faktenbericht und Doctor-Ergebnis |
 | DHCP/Gateway/Subnetze | Doctor-Collector | JSON-Faktenbericht und Doctor-Ergebnis |
-| Netzlaufwerke/SMB | Doctor-Collector; anschließend `setup --advanced` | `software_source.drive`, `unc_root`, `path_mappings` |
+| Netzlaufwerke/SMB | Doctor-Collector; anschließend **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** | `software_source.drive`, `unc_root`, `path_mappings` |
 | Enterprise-CA/AD CS | Doctor-Collector oder AD-CS-Team | Faktenbericht; danach nur bei Bedarf WinRM-/CA-Workflow |
 | Installerquelle | lokaler Ordner oder gemounteter SMB-Pfad auf dem Controller | `software_source.local_root` |
 
@@ -43,12 +43,9 @@ temporäre Fakten.
 
 ## SMB-Quelle und Windows-Laufwerk
 
-Der Standardordner im Laufzeitprojekt ist ideal für einen ersten Test oder
-lokal abgelegte Installer. Liegen die Installer auf einem Share, starte:
-
-~~~bash
-python3 mavi_provisioner.py setup --advanced
-~~~
+Der Standardordner im Laufzeitprojekt ist ideal für lokal abgelegte Installer.
+Liegen die Installer auf einem Share, öffne in der TUI **Grundprofil &
+Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten**.
 
 Wähle dort SMB/UNC, gib den bereits auf dem Controller erreichbaren lokalen
 Mount-Pfad an und ergänze bei Bedarf den Windows-Laufwerksbuchstaben sowie die
@@ -84,7 +81,7 @@ ersten SSH-PC gar nicht brauchen.
 ## Konfiguration korrigieren
 
 - Grunddaten ändern: **Schnellstart / Grundprofil** erneut öffnen.
-- SMB, Laufwerk, UNC oder Bootstrap-Pfade ändern: `setup --advanced`.
+- SMB, Laufwerk und UNC ändern: **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten**.
 - Benutzer/Kennwort ändern: **Zugangsdaten & Vault**.
 - Fehlende Fakten verstehen: **Doctor & Bereitschaft**.
 
