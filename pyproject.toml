@@ -9,7 +9,7 @@ description = "TUI-first Windows provisioning with Ansible"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "Mavi Provisioner contributors" }]
+authors = [{ name = "Rujbin N." }]
 dependencies = [
   "PyYAML>=6.0.3,<7",
 ]

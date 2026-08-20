@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Mavi Provisioner contributors
+# Copyright 2026 Rujbin N.
 # Zentrale Laufzeitabhängigkeiten für alle Provisioner-Module.
 """Standardbibliothek und optionale Python-Abhängigkeiten."""
 

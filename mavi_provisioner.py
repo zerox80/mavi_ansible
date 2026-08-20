@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Mavi Provisioner contributors
+# Copyright 2026 Rujbin N.
 """Kompatibler Programmeinstieg für Mavi Provisioner."""
 
 from windows_provisioner import VERSION, main

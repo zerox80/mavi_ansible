@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Mavi Provisioner contributors
+# Copyright 2026 Rujbin N.
 """Softwarekataloge, Parameterprofile und interaktive Auswahl."""
 
 from __future__ import annotations

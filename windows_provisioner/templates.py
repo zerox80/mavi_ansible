@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Mavi Provisioner contributors
+# Copyright 2026 Rujbin N.
 """Ansible- und PowerShell-Vorlagen für Windows-Endpunkte."""
 
 from __future__ import annotations
