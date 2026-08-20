@@ -47,3 +47,50 @@ Softwareordner. Benutzername und Vault folgen als eigener Schritt vor dem
 ersten PC. AD-Domäne, SMB-/Laufwerkszuordnung, Enterprise-CA und WinRM sind
 optionale Ausbauschritte. Der Doctor-Collector kann diese Umgebungsfakten auf
 einem bestehenden Windows-PC erfassen, statt sie beim ersten Start zu erraten.
+
+## Python-Module
+
+Die ausführbare Datei `mavi_provisioner.py` ist nur noch der kompatible
+Programmeinstieg. Die Implementierung liegt im neutral benannten Paket
+`windows_provisioner`, damit portable Änderungen aus dem Firmenprojekt an
+denselben Pfaden übernommen werden können.
+
+| Modul | Verantwortung |
+| --- | --- |
+| `_dependencies.py` | Standardbibliothek und optionale Python-Abhängigkeiten |
+| `settings.py` | Produktversion, Standardpfade und Datenvorlagen |
+| `templates.py` | Ansible- und PowerShell-Vorlagen |
+| `environment.py` | Projekt-, Datei-, Pfad- und Umgebungsverwaltung |
+| `installer_analysis.py` | Installer- und Silent-Switch-Analyse |
+| `catalogs.py` | Kataloge, Parameterprofile und interaktive Auswahl |
+| `software.py` | Office-, WinGet-, Store- und Softwareaufnahme-Workflows |
+| `reports.py` | Terminal-/HTML-Berichte und redigierte Ausgaben |
+| `printers.py` | INF-Analyse, Druckerkatalog und Installation |
+| `remote.py` | Transport-, Kerberos- und WinRM-Grundlagen |
+| `openssh.py` | OpenSSH-Bootstrap und Remotezugriffs-Workflows |
+| `execution.py` | Inventory-, Ansible- und Installationsausführung |
+| `clients.py` | Windows-Clientoptimierung und Programmbereinigung |
+| `cli.py` | Menüs, Argumentparser und Programmeinstieg |
+
+Abhängigkeiten zwischen Fachmodulen werden explizit im jeweiligen Workflow
+importiert. Es gibt keine nachträglich verdrahtete globale Registry und keine
+gegenseitigen Importzyklen.
+
+## Synchronisation mit Ansible-Windows-Script
+
+`Ansible-Windows-Script` bleibt die intern bewährte Firmenintegration;
+Mavi-Provisioner bleibt die allgemein nutzbare Open-Source-Variante. Beide
+verwenden dieselben Modulnamen und fachlichen Grenzen.
+
+1. Eine allgemeine Änderung wird im Firmen-Repository als eigener portabler
+   Commit im passenden `windows_provisioner/`-Modul umgesetzt.
+2. Firmenwerte und interne Sonderwege folgen in einem getrennten Commit.
+3. Der portable Commit wird mit `git cherry-pick -x <commit>` nach Mavi
+   übernommen.
+4. Notwendige Mavi-Ausgaben oder Defaults folgen als kleiner separater Commit.
+5. Der Pull Request nennt den korrespondierenden Commit des anderen
+   Repositories.
+
+Empfohlene Commit-Präfixe sind `core:` für portable Logik, `company:` für
+interne Integration, `mavi:` für die Open-Source-Schicht und `sync:` für eine
+unveränderte Übernahme. Ein Commit soll nur eine dieser Kategorien enthalten.

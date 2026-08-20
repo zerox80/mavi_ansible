@@ -18,7 +18,8 @@ dependencies = [
 pe = ["pefile==2024.8.26"]
 
 [project.scripts]
-mavi-provisioner = "mavi_provisioner:main"
+mavi-provisioner = "windows_provisioner.cli:main"
 
 [tool.setuptools]
 py-modules = ["mavi_provisioner"]
+packages = ["windows_provisioner"]
