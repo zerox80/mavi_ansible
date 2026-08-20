@@ -130,6 +130,8 @@ CONFIG_TEMPLATE = {
         "drive": "",
         "unc_root": "",
         "local_root": "",
+        "mount_user": "",
+        "mount_host": "",
     },
     "path_mappings": {},
     "ssh": {
@@ -3638,6 +3640,171 @@ def _mavi_prompt_source_root(default: str) -> str:
         print("! Bitte einen absoluten Pfad eingeben, z. B. /srv/mavi-software.")
 
 
+def _mavi_root_command_prefix() -> list[str]:
+    """Root-Aufrufe aus der TUI heraus ermöglichen."""
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid) and geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    if not sudo:
+        die("Für das automatische Einbinden der SMB-Freigabe fehlt sudo.")
+    return [sudo]
+
+
+def _mavi_has_cifs_support() -> bool:
+    return bool(
+        shutil.which("mount.cifs")
+        or Path("/usr/sbin/mount.cifs").is_file()
+        or Path("/sbin/mount.cifs").is_file()
+    )
+
+
+def _mavi_install_cifs_support() -> bool:
+    """Fehlende CIFS-Unterstützung direkt aus der TUI installieren."""
+    if _mavi_has_cifs_support():
+        return True
+
+    print()
+    print("Die SMB-Unterstützung (cifs-utils) fehlt auf dem Controller.")
+    if not yes_no("Jetzt automatisch installieren?", True):
+        return False
+
+    installers = (
+        ("apt-get", ["install", "-y", "cifs-utils"]),
+        ("dnf", ["install", "-y", "cifs-utils"]),
+        ("yum", ["install", "-y", "cifs-utils"]),
+        ("zypper", ["--non-interactive", "install", "cifs-utils"]),
+        ("pacman", ["-S", "--noconfirm", "cifs-utils"]),
+    )
+    for executable_name, arguments in installers:
+        executable = shutil.which(executable_name)
+        if not executable:
+            continue
+        command = _mavi_root_command_prefix() + [executable, *arguments]
+        result = subprocess.run(command, check=False)
+        if result.returncode == 0 and _mavi_has_cifs_support():
+            return True
+        print("! cifs-utils konnte nicht automatisch installiert werden.")
+        return False
+
+    print("! Kein unterstützter Paketmanager für cifs-utils gefunden.")
+    return False
+
+
+def _mavi_unc_mount_parts(unc_root: str) -> tuple[str, str]:
+    """UNC-Wurzel in CIFS-Share und optionalen Unterpfad zerlegen."""
+    normalized = str(unc_root or "").strip().replace("\\", "/")
+    if not normalized.startswith("//"):
+        raise ValueError("UNC muss mit \\\\ beginnen, z. B. \\\\server\\freigabe.")
+    parts = [part for part in normalized[2:].split("/") if part]
+    if len(parts) < 2:
+        raise ValueError("UNC muss Server und Freigabe enthalten.")
+    share = f"//{parts[0]}/{parts[1]}"
+    prefix_path = "/".join(parts[2:])
+    return share, prefix_path
+
+
+def _mavi_mount_smb_source(
+    unc_root: str,
+    mount_path: Path,
+    mount_user: str,
+    mount_host: str = "",
+) -> tuple[bool, str]:
+    """Eine SMB-Quelle interaktiv unter Mavis internem Pfad einbinden."""
+    if os.name == "nt":
+        print("! Automatisches CIFS-Mounting ist nur auf dem Linux-Controller verfügbar.")
+        return False, mount_host
+
+    try:
+        share, prefix_path = _mavi_unc_mount_parts(unc_root)
+    except ValueError as exc:
+        print(f"! {exc}")
+        return False, mount_host
+
+    share_server, share_name = share[2:].split("/", 1)
+    endpoint = str(mount_host or "").strip() or share_server
+    while True:
+        try:
+            socket.getaddrinfo(endpoint, 445, type=socket.SOCK_STREAM)
+            break
+        except socket.gaierror:
+            print()
+            print(f"! Der SMB-Server '{endpoint}' ist auf dem Controller nicht auflösbar.")
+            endpoint = prompt(
+                f"IP-Adresse oder vollständiger DNS-Name für {share_server}"
+            ).strip()
+            if not endpoint:
+                return False, ""
+    mount_share = f"//{endpoint}/{share_name}"
+
+    mount_path = mount_path.expanduser()
+    mount_path.mkdir(parents=True, exist_ok=True)
+    if os.path.ismount(mount_path):
+        return True, endpoint
+    if not _mavi_install_cifs_support():
+        return False, endpoint
+
+    options = ["vers=3.0"]
+    if prefix_path:
+        options.append(f"prefixpath={prefix_path}")
+
+    credentials_path: Path | None = None
+    try:
+        user = str(mount_user or "").strip()
+        if user:
+            password = getpass.getpass(f"SMB-Kennwort für {user}: ")
+            domain = ""
+            username = user
+            if "\\" in user:
+                domain, username = user.split("\\", 1)
+
+            fd, raw_credentials_path = tempfile.mkstemp(prefix="mavi-smb-")
+            credentials_path = Path(raw_credentials_path)
+            try:
+                os.fchmod(fd, 0o600)
+            except Exception:
+                os.close(fd)
+                raise
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"username={username}\n")
+                handle.write(f"password={password}\n")
+                if domain:
+                    handle.write(f"domain={domain}\n")
+            options.append(f"credentials={credentials_path}")
+        else:
+            options.append("guest")
+
+        mount_executable = shutil.which("mount") or "/usr/bin/mount"
+        command = _mavi_root_command_prefix() + [
+            mount_executable,
+            "-t",
+            "cifs",
+            mount_share,
+            str(mount_path),
+            "-o",
+            ",".join(options),
+        ]
+        print()
+        print(f"Mavi bindet {unc_root} jetzt automatisch ein …")
+        result = subprocess.run(command, check=False)
+    except (OSError, RuntimeError) as exc:
+        print(f"! SMB-Freigabe konnte nicht eingebunden werden: {exc}")
+        return False, endpoint
+    finally:
+        if credentials_path is not None:
+            try:
+                credentials_path.unlink()
+            except OSError:
+                pass
+
+    if result.returncode != 0 or not os.path.ismount(mount_path):
+        print("! SMB-Freigabe konnte nicht eingebunden werden.")
+        return False, endpoint
+
+    print(f"✓ SMB-Freigabe verbunden: {unc_root}")
+    return True, endpoint
+
+
 def cmd_setup(args: argparse.Namespace) -> None:
     """
     Den nicht-geheimen Teil einer neuen Umgebung schrittweise erfassen.
@@ -5505,6 +5672,24 @@ def choose_installer_path(config: dict[str, Any]) -> Path:
     local_root = _mavi_source_root(config)
     drive = _mavi_drive_label(source.get("drive"))
     source_name = _mavi_source_label(config)
+
+    if (
+        str(source.get("kind", "") or "").lower() == "smb"
+        and unc_root
+        and local_root is not None
+        and not os.path.ismount(local_root)
+    ):
+        print()
+        if yes_no(f"{unc_root} ist noch nicht verbunden. Jetzt verbinden?", True):
+            mounted, resolved_mount_host = _mavi_mount_smb_source(
+                unc_root,
+                local_root,
+                str(source.get("mount_user", "") or ""),
+                str(source.get("mount_host", "") or ""),
+            )
+            if not mounted:
+                die(f"SMB-Freigabe ist nicht erreichbar: {unc_root}")
+            source["mount_host"] = resolved_mount_host
 
     print()
     print("Softwarequelle")
@@ -9507,7 +9692,6 @@ OFFICE_PRODUCTS: dict[str, dict[str, Any]] = {
 
 
 def looks_like_office_candidate(path: Path) -> bool:
-    value = str(path).lower()
     name = path.name.lower()
 
     obvious_names = {
@@ -9518,21 +9702,23 @@ def looks_like_office_candidate(path: Path) -> bool:
     if name in obvious_names:
         return True
 
-    markers = (
-        "microsoft office",
-        "office365",
-        "office 365",
-        "microsoft 365",
-        "m365",
-        "project",
-        "visio",
-        "officedeployment",
-        "office deployment",
-        "\\odt\\",
-        "/odt/",
+    # Nicht blind im gesamten Pfad nach Teilzeichenfolgen suchen:
+    # "mavi-provisioner" enthält beispielsweise selbst "visio".
+    marker_pattern = re.compile(
+        r"(?<![a-z0-9])(?:"
+        r"microsoft[ _-]+office|"
+        r"office[ _-]*365|"
+        r"microsoft[ _-]*365|"
+        r"m365|"
+        r"project|"
+        r"visio|"
+        r"office[ _-]*deployment|"
+        r"officedeployment|"
+        r"odt"
+        r")(?![a-z0-9])"
     )
 
-    return any(marker in value for marker in markers)
+    return any(marker_pattern.search(part.lower()) for part in path.parts)
 
 
 def friendly_product_from_id(product_id: str) -> dict[str, Any] | None:
@@ -21744,26 +21930,92 @@ def mavi_software_source_setup(project: Path) -> None:
         str(source.get("label", "") or "").strip() or "Softwarequelle",
     ).strip() or "Softwarequelle"
 
-    source_root = _mavi_prompt_source_root(
-        str(source.get("local_root", "") or "").strip()
-        or str(project / "software-source")
-    )
-    source["local_root"] = source_root
-    if source_root:
-        try:
-            Path(source_root).expanduser().mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            print(f"! Software-Ordner konnte nicht automatisch angelegt werden: {exc}")
-
     source_kind = prompt_choice(
-        "Wie liegt die Softwarequelle auf dem Controller vor?",
+        "Wo liegt die Software?",
         [
-            ("1", "Lokaler oder gemounteter Ordner"),
-            ("2", "SMB/UNC-Quelle, die auf dem Controller gemountet ist"),
+            ("1", "Lokaler Ordner auf dem Controller"),
+            ("2", "Windows-Freigabe / UNC"),
         ],
         "2" if str(source.get("kind", "") or "").lower() == "smb" else "1",
     )
     source["kind"] = "smb" if source_kind == "2" else "local"
+
+    if source["kind"] == "smb":
+        while True:
+            unc_root = prompt(
+                "UNC-Wurzel (z. B. \\\\server\\freigabe)",
+                str(source.get("unc_root", "") or "").strip(),
+            ).strip().rstrip("\\/")
+            try:
+                share, _prefix_path = _mavi_unc_mount_parts(unc_root)
+            except ValueError as exc:
+                print(f"! {exc}")
+                continue
+            break
+
+        share_parts = [part for part in share[2:].split("/") if part]
+        mount_path = (
+            project
+            / "software-sources"
+            / slugify(share_parts[0])
+            / slugify(share_parts[1])
+        )
+        source_root = str(mount_path)
+        source["local_root"] = source_root
+        source["unc_root"] = unc_root
+
+        identity = config.get("identity", {}) or {}
+        default_mount_user = (
+            str(source.get("mount_user", "") or "").strip()
+            or str(identity.get("ansible_user", "") or "").strip()
+        )
+        mount_user_label = (
+            "SMB-Benutzer (DOMAIN\\Benutzer; 'gast' = Gast)"
+            if default_mount_user
+            else "SMB-Benutzer (DOMAIN\\Benutzer; Enter = Gast)"
+        )
+        mount_user = prompt(
+            mount_user_label,
+            default_mount_user,
+        ).strip()
+        source["mount_user"] = "" if mount_user.lower() == "gast" else mount_user
+
+        mount_host = str(source.get("mount_host", "") or "").strip()
+        domain_suffix = str(
+            (config.get("winrm_https", {}) or {}).get("domain_suffix", "") or ""
+        ).strip()
+        if not mount_host and "." not in share_parts[0] and domain_suffix:
+            mount_host = f"{share_parts[0]}.{domain_suffix}"
+
+        while True:
+            mounted, mount_host = _mavi_mount_smb_source(
+                unc_root,
+                mount_path,
+                str(source.get("mount_user", "") or ""),
+                mount_host,
+            )
+            source["mount_host"] = (
+                "" if mount_host.lower() == share_parts[0].lower() else mount_host
+            )
+            if mounted:
+                break
+            if not yes_no("SMB-Verbindung erneut versuchen?", True):
+                print("Softwarequelle wurde nicht geändert.")
+                return
+    else:
+        source_root = _mavi_prompt_source_root(
+            str(source.get("local_root", "") or "").strip()
+            or str(project / "software-source")
+        )
+        source["local_root"] = source_root
+        source["unc_root"] = ""
+        source["mount_user"] = ""
+        source["mount_host"] = ""
+        if source_root:
+            try:
+                Path(source_root).expanduser().mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                print(f"! Software-Ordner konnte nicht automatisch angelegt werden: {exc}")
 
     if yes_no(
         "Windows-Laufwerksbuchstabe für diese Quelle hinterlegen?",
@@ -21780,14 +22032,6 @@ def mavi_software_source_setup(project: Path) -> None:
             print("! Bitte nur einen Laufwerksbuchstaben wie S: eingeben.")
     else:
         source["drive"] = ""
-
-    if source["kind"] == "smb":
-        source["unc_root"] = prompt(
-            "UNC-Wurzel (z. B. \\\\server\\freigabe)",
-            str(source.get("unc_root", "") or "").strip(),
-        ).strip().rstrip("\\/")
-    else:
-        source["unc_root"] = ""
 
     mappings = dict(config.get("path_mappings", {}) or {})
     for old_key in (
@@ -21814,7 +22058,8 @@ def mavi_software_source_setup(project: Path) -> None:
     print()
     print("✓ Softwarequelle gespeichert.")
     print(f"  UNC:            {unc_root or '(keine)'}")
-    print(f"  Auf Controller: {source_root}")
+    if source["kind"] == "local":
+        print(f"  Lokaler Ordner: {source_root}")
 
 
 def mavi_setup_menu(project: Path) -> None:
@@ -21825,12 +22070,15 @@ def mavi_setup_menu(project: Path) -> None:
         local_root = str(source.get("local_root", "") or "").strip()
         unc_root = str(source.get("unc_root", "") or "").strip()
         drive = _mavi_drive_label(source.get("drive"))
+        source_kind = str(source.get("kind", "local") or "local").lower()
 
         print()
         print("GRUNDPROFIL & SOFTWAREQUELLE")
         print("============================")
-        print(f"  Controller-Pfad:  {local_root or '(noch nicht gesetzt)'}")
-        print(f"  UNC-Wurzel:       {unc_root or '(keine)'}")
+        if source_kind == "smb":
+            print(f"  Windows-Freigabe: {unc_root or '(noch nicht gesetzt)'}")
+        else:
+            print(f"  Lokaler Ordner:   {local_root or '(noch nicht gesetzt)'}")
         print(f"  Windows-Laufwerk: {drive or '(keins)'}")
         print()
         print("  1) Grundprofil bearbeiten")

@@ -47,11 +47,13 @@ Der Standardordner im Laufzeitprojekt ist ideal für lokal abgelegte Installer.
 Liegen die Installer auf einem Share, öffne in der TUI **Grundprofil &
 Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten**.
 
-Wähle dort SMB/UNC, gib den bereits auf dem Controller erreichbaren lokalen
-Mount-Pfad an und ergänze bei Bedarf den Windows-Laufwerksbuchstaben sowie die
-UNC-Wurzel. Mavi verwendet die Zuordnung nur, um Windows-Pfade aus einem
-Katalog zuverlässig auf den Controller-Pfad abzubilden. Es mountet kein SMB
-Share mit geheimen Zugangsdaten im Hintergrund.
+Wähle dort **Windows-Freigabe / UNC** und gib die UNC-Wurzel sowie optional den
+Windows-Laufwerksbuchstaben an. Mavi wählt den internen Controller-Pfad selbst,
+installiert bei Bedarf `cifs-utils` und bindet die Freigabe direkt aus der TUI
+ein. Falls die Freigabe eine Anmeldung verlangt, werden Benutzer und Kennwort
+ebenfalls im Dialog abgefragt. Kann der Linux-Controller einen kurzen
+Windows-Servernamen nicht per DNS auflösen, fragt Mavi in derselben TUI nach
+der zugehörigen IP-Adresse oder dem vollständigen DNS-Namen.
 
 ## AD und WinRM erst dann aktivieren, wenn benötigt
 

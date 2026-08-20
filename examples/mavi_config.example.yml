@@ -32,6 +32,8 @@ software_source:
   drive: ""
   unc_root: ""
   local_root: ""
+  mount_user: ""
+  mount_host: ""
 
 # Windows / UNC path -> controller-local path
 path_mappings: {}

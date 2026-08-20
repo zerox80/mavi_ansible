@@ -61,7 +61,7 @@ Der einfache Assistent verlangt nicht alles auf einmal:
 | Windows-/Domänen-Benutzer | vor dem ersten PC | Schnellstart oder **Zugangsdaten & Vault** |
 | Kennwort | vor dem ersten PC | ausschließlich **Zugangsdaten & Vault** |
 | AD-DNS-Domäne | nur für PSRP/WinRM mit Kerberos | Schnellstart oder später `setup --advanced` |
-| SMB-Quelle / Laufwerk | nur wenn Installer auf einem Share liegen | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** |
+| SMB-Quelle / Laufwerk | nur wenn Installer auf einem Share liegen | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten**; Mavi bindet die UNC-Quelle aus der TUI ein |
 | Bootstrap-Webroot | nur wenn OpenSSH bereitgestellt wird | wird aus der Controller-IP vorbereitet oder in `setup --advanced` angepasst |
 | Domänencontroller, DNS, DHCP, Netzlaufwerke, Enterprise-CA | zur Bestandsaufnahme, nicht für den ersten Programmstart | Doctor → Offline-Collector oder bestehende Remote-Verbindung |
 

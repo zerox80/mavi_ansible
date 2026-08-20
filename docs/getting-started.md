@@ -92,7 +92,7 @@ verwendet.
 
 | Bedarf | Nächster Schritt |
 | --- | --- |
-| Software liegt auf SMB/UNC | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** |
+| Software liegt auf SMB/UNC | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten**; UNC und Anmeldung werden in der TUI abgefragt |
 | Windows-Laufwerk abbilden | **Grundprofil & Softwarequelle** → **Softwarequelle, UNC und Laufwerk einrichten** |
 | AD-Domäne/WinRM-Kerberos | AD-DNS-Domäne im Setup setzen, danach Doctor → WinRM prüfen |
 | DC, DNS, DHCP, Netzlaufwerke oder CA inventarisieren | Doctor → Offline-Collector oder Remote-Doctor |
