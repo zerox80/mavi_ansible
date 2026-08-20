@@ -9,7 +9,7 @@ description = "TUI-first Windows provisioning with Ansible"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "Mavi Provisioner contributors" }]
+authors = [{ name = "Rujbin N." }]
 dependencies = [
   "PyYAML>=6.0.3,<7",
 ]
@@ -18,7 +18,8 @@ dependencies = [
 pe = ["pefile==2024.8.26"]
 
 [project.scripts]
-mavi-provisioner = "mavi_provisioner:main"
+mavi-provisioner = "windows_provisioner.cli:main"
 
 [tool.setuptools]
 py-modules = ["mavi_provisioner"]
+packages = ["windows_provisioner"]
