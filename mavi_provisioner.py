@@ -20065,7 +20065,7 @@ def ssh_menu(project: Path) -> None:
                 cmd_ssh_keygen(argparse.Namespace(project=project, key=None, yes=False))
             elif choice == "2":
                 host = choose_host_interactive(project)
-                cmd_ssh_guide(argparse.Namespace(project=project, host=host, key=None, msi=None, prompt_msi=False))
+                cmd_ssh_guide(argparse.Namespace(project=project, host=host, key=None, msi=None, prompt_msi=True))
             elif choice == "3":
                 host = choose_host_interactive(project)
                 cmd_ssh_use(argparse.Namespace(project=project, host=host, key=None, port=None, yes=False))

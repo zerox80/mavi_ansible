@@ -5,6 +5,7 @@
 - Vollständigen Software-Installationslauf an eine einzige gebundene Ansible-Sitzung gekoppelt.
 - Haupt-Playbook, Installed-Precheck, Live-Proben, Nachlaufkontrolle und Erreichbarkeitsprüfung verwenden denselben vorab geprüften Kerberos-Ticket-Cache und denselben Ansible-Python.
 - Ansible-Startpunkt und Inventory-Pfad werden für den gesamten Lauf festgehalten; benannte Inventory-Credentials werden bei Kerberos-Sitzungen leer überlagert.
+- Die interaktive OpenSSH-Vollautomatik fragt wieder nach der optionalen OpenSSH-MSI; Enter verwendet weiterhin Windows Capability/FoD.
 
 ## 0.9.5-oss
 
