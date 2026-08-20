@@ -17975,6 +17975,11 @@ def _ssh_bootstrap_ps1(
     ps_ansible_ip = _powershell_single_quote(ansible_server_ip)
     ps_instance_id = _powershell_single_quote(bootstrap_instance_id)
     ps_ca_thumbprint = _powershell_single_quote(bootstrap_ca_thumbprint.upper())
+    # Wird eine MSI bewusst angegeben, darf der Bootstrap nicht still auf die
+    # Windows-Capability ausweichen. Sonst sieht der Admin zwar "OpenSSH
+    # installiert", bekommt aber nicht die explizit ausgewählte MSI.
+    msi_requested = bool(msi_download_url or bundled_msi or msi_path)
+    ps_msi_requested = "$true" if msi_requested else "$false"
 
     if msi_download_url:
         msi_assignment_lines = [
@@ -17990,9 +17995,8 @@ def _ssh_bootstrap_ps1(
             "    if (-not (Test-Path -LiteralPath $msiPath)) { throw 'Downloaddatei wurde nicht angelegt.' }",
             "}",
             "catch {",
-            "    Write-Warning \"HTTPS-MSI-Download fehlgeschlagen: $($_.Exception.Message)\"",
-            "    Write-Warning 'Mavi verwendet den Windows-Capability/FoD-Fallback.'",
-            "    $msiPath = ''",
+            "    throw \"OpenSSH-MSI-Download fehlgeschlagen: $($_.Exception.Message). " +
+            "Eine OpenSSH-MSI wurde explizit angefordert; Windows-Capability/FoD wird nicht verwendet.\"",
             "}",
         ]
     elif bundled_msi:
@@ -18054,24 +18058,44 @@ def _ssh_bootstrap_ps1(
         "}",
         "",
         *msi_assignment_lines,
+        f"$maviMsiRequested = {ps_msi_requested}",
         "Write-Host '[2/9] OpenSSH Server prüfen...' -ForegroundColor Cyan",
         "$sshd = Get-Service -Name sshd -ErrorAction SilentlyContinue",
         "if (-not $sshd) {",
-        "    if (-not [string]::IsNullOrWhiteSpace($msiPath) -and (Test-Path -LiteralPath $msiPath)) {",
+        "    if ($maviMsiRequested) {",
+        "        if ([string]::IsNullOrWhiteSpace($msiPath) -or -not (Test-Path -LiteralPath $msiPath)) {",
+        "            throw \"OpenSSH-MSI ist nicht erreichbar: $msiPath. Eine MSI wurde explizit angefordert; Windows-Capability/FoD wird nicht verwendet.\"",
+        "        }",
         "        Write-Host '[3/9] OpenSSH-MSI prüfen und installieren...' -ForegroundColor Cyan",
         "        Assert-MaviMsiTrust -Path $msiPath -ExpectedSha256 $expectedMsiSha256 -ExpectedSigner $expectedMsiSigner",
         "        $quotedMsi = '\"' + $msiPath + '\"'",
         "        $msi = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\\msiexec.exe') -ArgumentList \"/i $quotedMsi /qn /norestart\" -Wait -PassThru",
+        "        $msiExitCode = $msi.ExitCode",
         "        if ($msi.ExitCode -notin @(0, 1641, 3010)) {",
-        "            Write-Warning \"MSI meldete Exit-Code $($msi.ExitCode). Mavi versucht den Windows-Capability/FoD-Fallback.\"",
+        "            throw \"OpenSSH-MSI meldete Exit-Code $($msi.ExitCode). Windows-Capability/FoD wird nicht verwendet.\"",
         "        }",
         "        else { Write-Host \"    MSI erfolgreich, Exit-Code $($msi.ExitCode).\" -ForegroundColor Green }",
-        "    }",
-        "    elseif (-not [string]::IsNullOrWhiteSpace($msiPath)) {",
-        "        Write-Warning \"MSI nicht erreichbar: $msiPath\"",
+        "        $sshd = Get-Service -Name sshd -ErrorAction SilentlyContinue",
+        "        if (-not $sshd -and $msiExitCode -in @(1641, 3010)) {",
+        "            throw \"OpenSSH-MSI meldete Exit-Code $msiExitCode und benötigt einen Neustart, bevor sshd verfügbar ist. Nach dem Neustart den Starter erneut ausführen.\"",
+        "        }",
+        "        if (-not $sshd) {",
+        "            Write-Host '    MSI meldet Erfolg, aber sshd fehlt. MSI-Reparatur wird ausgeführt...' -ForegroundColor Yellow",
+        "            $repair = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\\msiexec.exe') -ArgumentList \"/fa $quotedMsi /qn /norestart\" -Wait -PassThru",
+        "            if ($repair.ExitCode -notin @(0, 1641, 3010)) {",
+        "                throw \"OpenSSH-MSI-Reparatur meldete Exit-Code $($repair.ExitCode). Windows-Capability/FoD wird nicht verwendet.\"",
+        "            }",
+        "            if ($repair.ExitCode -in @(1641, 3010)) {",
+        "                throw \"OpenSSH-MSI-Reparatur meldete Exit-Code $($repair.ExitCode) und benötigt einen Neustart, bevor sshd verfügbar ist. Nach dem Neustart den Starter erneut ausführen.\"",
+        "            }",
+        "            $sshd = Get-Service -Name sshd -ErrorAction SilentlyContinue",
+        "        }",
         "    }",
         "    $sshd = Get-Service -Name sshd -ErrorAction SilentlyContinue",
         "    if (-not $sshd) {",
+        "        if ($maviMsiRequested) {",
+        "            throw 'Die OpenSSH-MSI wurde ausgeführt, aber der Dienst sshd ist danach nicht vorhanden. Windows-Capability/FoD wird nicht verwendet.'",
+        "        }",
         "        Write-Host '[3/9] OpenSSH als Windows Capability installieren (Fallback)...' -ForegroundColor Yellow",
         "        Write-Host '    Dieser Schritt kann über Windows Update/WSUS mehrere Minuten dauern.' -ForegroundColor Yellow",
         "        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1",
