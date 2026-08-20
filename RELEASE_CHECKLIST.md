@@ -1,6 +1,6 @@
 # Open-source release checklist
 
-Vor dem ersten Push in ein öffentliches Repository:
+Vor jedem versionierten Release beziehungsweise Git-Tag:
 
 - [ ] Rechteinhaber hat bestätigt, dass Quellcode, Historie und Assets veröffentlicht werden dürfen.
 - [ ] Alle Firmen-/Kundendaten wurden gesucht und entfernt: Domains, IPs, UNC-Pfade, Hostnamen, Benutzernamen, Zertifikate, Schlüssel, Inventories, Softwarekataloge und Logs.

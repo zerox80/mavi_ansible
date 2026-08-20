@@ -121,7 +121,7 @@ zugehörige SBOM werden erst aus der festgelegten Release-Build-Umgebung erzeugt
 und zusammen mit dem Release veröffentlicht. Herkunft und Pflege stehen in
 [DEPENDENCIES.md](DEPENDENCIES.md).
 
-Vor einem öffentlichen Push ist die vollständige
+Vor einem versionierten Release beziehungsweise Git-Tag ist die vollständige
 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) durch den Rechteinhaber
 abzuzeichnen. Beiträge sind willkommen; siehe [CONTRIBUTING.md](CONTRIBUTING.md).
 
