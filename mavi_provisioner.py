@@ -7,6 +7,11 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.6 binds the complete software installation run to one Ansible session.
+The main playbook, installed precheck, live probes, post-install checks and
+reachability checks now use the same validated inventory, Ansible entry point,
+Ansible Python runtime and private Kerberos ticket cache.
+
 v0.9.5 prevents the 180-second timeout during the WinRM reset. Listener
 removal is now verified while WinRM is still running. After the service has
 been stopped and disabled, Mavi confirms the final state only through the
@@ -75,7 +80,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 # Ein neues Projekt wird bewusst außerhalb des Quell-Repositorys angelegt.
 # So bleiben Umgebungswerte, Inventories, Zertifikate und Secrets getrennt
 # vom veröffentlichbaren Programmcode.
@@ -15345,76 +15350,93 @@ def _kerberos_cache_connection_overrides() -> dict[str, str]:
     }
 
 
-def _ansible_command_with_kerberos_cache(
-    command: list[str],
+def _open_client_ansible_session(
     *,
-    enabled: bool,
-) -> list[str]:
-    """Cache-only-Credentials mit höchster Ansible-Variablenpriorität setzen."""
-    if not enabled:
-        return command
-    return [
-        *command,
-        "--extra-vars",
-        json.dumps(
-            _kerberos_cache_connection_overrides(),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-    ]
-
-
-def _prepare_client_runner_runtime(
     project: Path,
-    *,
     host: str,
     vault_password_file: Path,
-) -> tuple[dict[str, str], Path | None, Path | None]:
-    """Den normalen Client-Runner an den bewährten privaten CCache binden."""
+) -> dict[str, Any]:
+    """Gebundene Ansible-Laufzeit samt privatem Kerberos-Cache öffnen."""
     _inventory, windows, host_data = _host_inventory_entry(project, host)
-    connection = str(
-        _effective_host_var(windows, host_data, "ansible_connection", "") or ""
-    ).strip().lower()
-    if connection != "psrp":
-        return os.environ.copy(), None, None
+    ansible_executable, ansible_python = _ansible_playbook_runtime()
+    session: dict[str, Any] = {
+        "host": host,
+        "ansible_executable": ansible_executable,
+        "ansible_python": ansible_python,
+        "inventory_path": project_paths(project)["inventory"],
+        "environment": _ansible_runtime_environment(ansible_python),
+        "extra_vars": {},
+        "kerberos_ticket_directory": None,
+        "kerberos_ticket_path": None,
+    }
 
-    protocol = str(
-        _effective_host_var(windows, host_data, "ansible_psrp_protocol", "") or ""
+    connection = str(
+        _effective_host_var(windows, host_data, "ansible_connection", "psrp")
+        or "psrp"
     ).strip().lower()
     auth = str(
         _effective_host_var(windows, host_data, "ansible_psrp_auth", "") or ""
     ).strip().lower()
-    if auth != "kerberos":
-        return os.environ.copy(), None, None
-    if protocol != "https":
+    saved_state = host_data.get("mavi_winrm_https")
+    saved_kerberos = (
+        isinstance(saved_state, dict)
+        and saved_state.get("kerberos_verified") is True
+        and str(saved_state.get("auth", "") or "").strip().lower() == "kerberos"
+    )
+    if connection != "psrp" or (auth != "kerberos" and not saved_kerberos):
+        return session
+
+    protocol = str(
+        _effective_host_var(windows, host_data, "ansible_psrp_protocol", "") or ""
+    ).strip().lower()
+    if protocol and protocol != "https":
         raise RuntimeError(
-            "Der Client-Runner verwendet PSRP/Kerberos nur mit dem gespeicherten HTTPS-Endpunkt."
+            "Die Client-Ansible-Sitzung verwendet PSRP/Kerberos nur mit dem gespeicherten HTTPS-Endpunkt."
         )
 
-    _ansible_executable, ansible_python = _ansible_playbook_runtime()
-    runtime_environment = _ansible_runtime_environment(ansible_python)
-    _settings, fqdn, _ca_cert, kerberos_principal = _saved_winrm_https_transport(
-        project,
-        host_data,
-    )
-    cache_directory, cache_path, cache_principal = _acquire_vault_kerberos_ticket(
-        project,
-        host=host,
-        vault_password_file=vault_password_file,
-        kerberos_principal=kerberos_principal,
-        ansible_python=ansible_python,
-        target_fqdn=fqdn,
-    )
     try:
-        runtime_environment["KRB5CCNAME"] = f"FILE:{cache_path}"
-        print(
-            f"  ✓ Client-Runner nutzt privaten Kerberos-Cache: {cache_principal}; "
-            f"host/{fqdn} ist bestätigt."
+        _settings, fqdn, _ca_cert, kerberos_principal = _saved_winrm_https_transport(
+            project,
+            host_data,
         )
-        return runtime_environment, cache_directory, cache_path
-    except BaseException:
+        cache_directory, cache_path, cache_principal = _acquire_vault_kerberos_ticket(
+            project,
+            host=host,
+            vault_password_file=vault_password_file,
+            kerberos_principal=kerberos_principal,
+            ansible_python=ansible_python,
+            target_fqdn=fqdn,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimeError(
+            "Die private Kerberos-Sitzung für die Client-Aktion konnte nicht "
+            f"vorbereitet werden: {redact_sensitive_text(exc)}"
+        ) from exc
+
+    session["kerberos_ticket_directory"] = cache_directory
+    session["kerberos_ticket_path"] = cache_path
+    session["environment"]["KRB5CCNAME"] = f"FILE:{cache_path}"
+    session["extra_vars"] = _kerberos_cache_connection_overrides()
+    print(
+        f"  ✓ Private Kerberos-Sitzung: {cache_principal}; "
+        f"host/{fqdn} ist bestätigt."
+    )
+    return session
+
+
+def _close_client_ansible_session(session: dict[str, Any] | None) -> None:
+    """Den von der äußeren Client-Sitzung besessenen Ticket-Cache entfernen."""
+    if session is None:
+        return
+    cache_directory = session.get("kerberos_ticket_directory")
+    cache_path = session.get("kerberos_ticket_path")
+    if isinstance(cache_directory, Path) and isinstance(cache_path, Path):
         _discard_kerberos_ticket_cache(cache_directory, cache_path)
-        raise
+    session["kerberos_ticket_directory"] = None
+    session["kerberos_ticket_path"] = None
+    environment = session.get("environment")
+    if isinstance(environment, dict):
+        environment.pop("KRB5CCNAME", None)
 
 
 def _run_winrm_temporary_play(
@@ -20904,15 +20926,51 @@ def print_remote_live_probe(
     print()
 
 
+def _bound_ansible_session_context(
+    *,
+    host: str,
+    ansible_session: dict[str, Any],
+) -> tuple[Path, Path, Path, dict[str, str], dict[str, Any]]:
+    """Prozesskontext einer bereits geöffneten Ansible-Sitzung validieren."""
+    if str(ansible_session.get("host") or "") != host:
+        raise RuntimeError("Die Ansible-Sitzung gehört zu einem anderen PC.")
+
+    ansible_executable = ansible_session.get("ansible_executable")
+    ansible_python = ansible_session.get("ansible_python")
+    inventory_path = ansible_session.get("inventory_path")
+    if not all(isinstance(value, Path) for value in (
+        ansible_executable,
+        ansible_python,
+        inventory_path,
+    )):
+        raise RuntimeError("Die Ansible-Sitzung ist unvollständig.")
+
+    raw_environment = ansible_session.get("environment")
+    raw_extra_vars = ansible_session.get("extra_vars")
+    if not isinstance(raw_environment, dict) or not isinstance(raw_extra_vars, dict):
+        raise RuntimeError("Der Prozesskontext der Ansible-Sitzung ist ungültig.")
+
+    environment = {
+        str(key): str(value)
+        for key, value in raw_environment.items()
+    }
+    return (
+        ansible_executable,
+        ansible_python,
+        inventory_path,
+        environment,
+        dict(raw_extra_vars),
+    )
+
+
 def run_remote_live_probe(
     *,
     project: Path,
     host: str,
     app: dict[str, Any],
     vault_password_file: Path,
+    ansible_session: dict[str, Any],
     timeout: float = 12.0,
-    runtime_environment: dict[str, str] | None = None,
-    kerberos_cache_only: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
     Zweite kurze Ansible-Verbindung während der Hauptinstallation.
@@ -20946,6 +21004,17 @@ def run_remote_live_probe(
     try:
         output_path.unlink(missing_ok=True)
 
+        (
+            ansible_executable,
+            ansible_python,
+            inventory_path,
+            runtime_environment,
+            transport_vars,
+        ) = _bound_ansible_session_context(
+            host=host,
+            ansible_session=ansible_session,
+        )
+
         extra = {
             "mavi_probe_installer_path": remote_installer,
             "mavi_probe_installer_name": installer_name,
@@ -20954,11 +21023,14 @@ def run_remote_live_probe(
             ),
             "mavi_probe_output_file": str(output_path),
         }
+        extra.update(transport_vars)
 
         cmd = [
-            "ansible-playbook",
+            str(ansible_python),
+            "-I",
+            str(ansible_executable),
             "-i",
-            str(project_paths(project)["inventory"]),
+            str(inventory_path),
             str(probe_playbook),
             "--limit",
             host,
@@ -20967,10 +21039,6 @@ def run_remote_live_probe(
             "-e",
             json.dumps(extra, ensure_ascii=False),
         ]
-        cmd = _ansible_command_with_kerberos_cache(
-            cmd,
-            enabled=kerberos_cache_only,
-        )
 
         try:
             result = subprocess.run(
@@ -21042,11 +21110,10 @@ def run_install_subprocess(
     *,
     host: str,
     apps: dict[str, dict[str, Any]],
+    ansible_session: dict[str, Any],
     status_interval: float = 10.0,
     vault_password_file: Path | None = None,
     live_probe: bool = True,
-    runtime_environment: dict[str, str] | None = None,
-    kerberos_cache_only: bool = False,
 ) -> int:
     """
     Ansible-Ausgabe live durchreichen.
@@ -21060,15 +21127,14 @@ def run_install_subprocess(
     - KEIN automatischer Abbruch
     - KEINE manuellen Befehle auf dem Ziel-PC
     """
-    cmd = _ansible_command_with_kerberos_cache(
-        cmd,
-        enabled=kerberos_cache_only,
-    )
     shown_command = " ".join(shlex_quote(x) for x in cmd)
     print("\n→ " + redact_sensitive_text(shown_command))
     print()
 
-    env = (runtime_environment or os.environ).copy()
+    _, _, _, env, _ = _bound_ansible_session_context(
+        host=host,
+        ansible_session=ansible_session,
+    )
     # Hilft Python-basierten Child-Prozessen, Ausgaben zeitnah zu flushen.
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -21172,8 +21238,7 @@ def run_install_subprocess(
                             host=host,
                             app=app,
                             vault_password_file=vault_password_file,
-                            runtime_environment=runtime_environment,
-                            kerberos_cache_only=kerberos_cache_only,
+                            ansible_session=ansible_session,
                         )
 
                         if probe is not None:
@@ -21354,11 +21419,10 @@ def wait_for_post_install_settle(
     host: str,
     app: dict[str, Any],
     vault_password_file: Path,
+    ansible_session: dict[str, Any],
     baseline_pids: set[int],
     max_wait_seconds: float = 90.0,
     poll_seconds: float = 5.0,
-    runtime_environment: dict[str, str] | None = None,
-    kerberos_cache_only: bool = False,
 ) -> tuple[bool, str]:
     """
     Verhindert, dass bei einer Katalogserie das nächste Paket startet,
@@ -21374,9 +21438,8 @@ def wait_for_post_install_settle(
             host=host,
             app=app,
             vault_password_file=vault_password_file,
+            ansible_session=ansible_session,
             timeout=12.0,
-            runtime_environment=runtime_environment,
-            kerberos_cache_only=kerberos_cache_only,
         )
 
         if probe is None:
@@ -21423,32 +21486,51 @@ def wait_for_host_ready(
     project: Path,
     host: str,
     vault_password_file: Path,
+    ansible_session: dict[str, Any],
     max_wait_seconds: float = 180.0,
-    runtime_environment: dict[str, str] | None = None,
-    kerberos_cache_only: bool = False,
 ) -> bool:
     """
     Vor dem nächsten Paket kurz win_ping prüfen. Wenn ein vorheriger Installer
     Windows neu gestartet hat, wartet die Serie auf die Rückkehr des PCs.
     """
+    (
+        ansible_executable,
+        ansible_python,
+        inventory_path,
+        runtime_environment,
+        transport_vars,
+    ) = _bound_ansible_session_context(
+        host=host,
+        ansible_session=ansible_session,
+    )
+    ansible_ad_hoc = ansible_executable.with_name("ansible")
+    if not ansible_ad_hoc.is_file():
+        raise RuntimeError(
+            "Das ansible-Kommando fehlt in der erkannten Ansible-Umgebung."
+        )
+
+    cmd = [
+        str(ansible_python),
+        "-I",
+        str(ansible_ad_hoc),
+        "-i",
+        str(inventory_path),
+        host,
+        "-m",
+        "ansible.windows.win_ping",
+        "--vault-password-file",
+        str(vault_password_file),
+    ]
+    if transport_vars:
+        cmd.extend([
+            "--extra-vars",
+            json.dumps(transport_vars, ensure_ascii=True, separators=(",", ":")),
+        ])
+
     deadline = time.monotonic() + max(1.0, max_wait_seconds)
     first_failure = True
 
     while True:
-        cmd = [
-            "ansible",
-            "-i",
-            str(project_paths(project)["inventory"]),
-            host,
-            "-m",
-            "ansible.windows.win_ping",
-            "--vault-password-file",
-            str(vault_password_file),
-        ]
-        cmd = _ansible_command_with_kerberos_cache(
-            cmd,
-            enabled=kerberos_cache_only,
-        )
 
         try:
             result = subprocess.run(
@@ -21522,9 +21604,8 @@ def precheck_installed_apps(
     catalog: dict[str, Any],
     selected_keys: list[str],
     vault_password_file: Path,
+    ansible_session: dict[str, Any],
     timeout: float = 45.0,
-    runtime_environment: dict[str, str] | None = None,
-    kerberos_cache_only: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     # Sicherer Precheck vor "Alle Programme".
     #
@@ -21886,20 +21967,34 @@ $Ansible.Changed = $false
             )
             tmp_path = Path(fh.name)
 
+        (
+            ansible_executable,
+            ansible_python,
+            inventory_path,
+            runtime_environment,
+            transport_vars,
+        ) = _bound_ansible_session_context(
+            host=host,
+            ansible_session=ansible_session,
+        )
+
         cmd = [
-            "ansible-playbook",
+            str(ansible_python),
+            "-I",
+            str(ansible_executable),
             "-i",
-            str(project_paths(project)["inventory"]),
+            str(inventory_path),
             str(tmp_path),
             "--limit",
             host,
             "--vault-password-file",
             str(vault_password_file),
         ]
-        cmd = _ansible_command_with_kerberos_cache(
-            cmd,
-            enabled=kerberos_cache_only,
-        )
+        if transport_vars:
+            cmd.extend([
+                "--extra-vars",
+                json.dumps(transport_vars, ensure_ascii=True, separators=(",", ":")),
+            ])
 
         try:
             completed = subprocess.run(
@@ -21980,6 +22075,7 @@ def _build_install_command(
     software_names: list[str],
     target_user: str,
     vault_password_file: Path,
+    ansible_session: dict[str, Any],
     check: bool,
 ) -> list[str]:
     extra = {
@@ -21988,11 +22084,24 @@ def _build_install_command(
         "software_names": software_names,
         "target_user": target_user,
     }
+    (
+        ansible_executable,
+        ansible_python,
+        inventory_path,
+        _runtime_environment,
+        transport_vars,
+    ) = _bound_ansible_session_context(
+        host=host,
+        ansible_session=ansible_session,
+    )
+    extra.update(transport_vars)
 
     cmd = [
-        "ansible-playbook",
+        str(ansible_python),
+        "-I",
+        str(ansible_executable),
         "-i",
-        str(project_paths(project)["inventory"]),
+        str(inventory_path),
         str(playbook),
         "--limit",
         host,
@@ -22138,27 +22247,22 @@ def cmd_install(args: argparse.Namespace) -> None:
 
     vault_password = getpass.getpass("Vault password: ")
     vault_password_file = create_temporary_vault_password_file(vault_password)
+    ansible_session: dict[str, Any] | None = None
+    try:
+        ansible_session = _open_client_ansible_session(
+            project=args.project,
+            host=args.host,
+            vault_password_file=vault_password_file,
+        )
+    except RuntimeError as exc:
+        vault_password_file.unlink(missing_ok=True)
+        die(str(exc), code=2)
 
     results: list[dict[str, Any]] = []
 
     installed_precheck: dict[str, dict[str, Any]] = {}
-    client_runtime_environment: dict[str, str] | None = None
-    kerberos_ticket_directory: Path | None = None
-    kerberos_ticket_path: Path | None = None
-    kerberos_cache_only = False
 
     try:
-        (
-            client_runtime_environment,
-            kerberos_ticket_directory,
-            kerberos_ticket_path,
-        ) = _prepare_client_runner_runtime(
-            args.project,
-            host=args.host,
-            vault_password_file=vault_password_file,
-        )
-        kerberos_cache_only = kerberos_ticket_path is not None
-
         if args.all and not args.check:
             print()
             print("[Mavi SMART] Prüfe zuerst, welche Programme bereits installiert sind ...")
@@ -22169,9 +22273,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                 catalog=catalog,
                 selected_keys=selected_keys,
                 vault_password_file=vault_password_file,
+                ansible_session=ansible_session,
                 timeout=45.0,
-                runtime_environment=client_runtime_environment,
-                kerberos_cache_only=kerberos_cache_only,
             )
 
             if precheck_error:
@@ -22198,9 +22301,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                     project=args.project,
                     host=args.host,
                     vault_password_file=vault_password_file,
+                    ansible_session=ansible_session,
                     max_wait_seconds=180.0,
-                    runtime_environment=client_runtime_environment,
-                    kerberos_cache_only=kerberos_cache_only,
                 ):
                     print()
                     print("[Mavi SMART] Ziel-PC ist nach 180s nicht erreichbar.")
@@ -22247,9 +22349,8 @@ def cmd_install(args: argparse.Namespace) -> None:
                     host=args.host,
                     app=app,
                     vault_password_file=vault_password_file,
+                    ansible_session=ansible_session,
                     timeout=12.0,
-                    runtime_environment=client_runtime_environment,
-                    kerberos_cache_only=kerberos_cache_only,
                 )
 
                 if baseline_probe is not None:
@@ -22298,6 +22399,7 @@ def cmd_install(args: argparse.Namespace) -> None:
                 software_names=[key],
                 target_user=target_user,
                 vault_password_file=vault_password_file,
+                ansible_session=ansible_session,
                 check=bool(args.check),
             )
 
@@ -22306,11 +22408,10 @@ def cmd_install(args: argparse.Namespace) -> None:
                 args.project,
                 host=args.host,
                 apps={key: app},
+                ansible_session=ansible_session,
                 status_interval=status_interval,
                 vault_password_file=vault_password_file,
                 live_probe=live_probe_enabled,
-                runtime_environment=client_runtime_environment,
-                kerberos_cache_only=kerberos_cache_only,
             )
 
             if return_code == 130:
@@ -22334,11 +22435,10 @@ def cmd_install(args: argparse.Namespace) -> None:
                     host=args.host,
                     app=app,
                     vault_password_file=vault_password_file,
+                    ansible_session=ansible_session,
                     baseline_pids=baseline_pids,
                     max_wait_seconds=90.0,
                     poll_seconds=5.0,
-                    runtime_environment=client_runtime_environment,
-                    kerberos_cache_only=kerberos_cache_only,
                 )
 
                 if not settle_ok:
@@ -22361,11 +22461,7 @@ def cmd_install(args: argparse.Namespace) -> None:
                 )
 
     finally:
-        if kerberos_ticket_directory is not None and kerberos_ticket_path is not None:
-            _discard_kerberos_ticket_cache(
-                kerberos_ticket_directory,
-                kerberos_ticket_path,
-            )
+        _close_client_ansible_session(ansible_session)
         vault_password_file.unlink(missing_ok=True)
 
     print()
