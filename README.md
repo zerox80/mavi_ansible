@@ -12,8 +12,8 @@ Fork des Python-Skripts zu bauen.
 
 ## Schnellstart in wenigen Minuten
 
-Auf dem Linux-Ansible-Controller einmal die festgelegten Abhängigkeiten
-installieren:
+Auf einem Linux-Ansible-Controller mit Python 3.11 oder neuer einmal die
+festgelegten Abhängigkeiten installieren:
 
 ~~~bash
 python3 -m venv .venv
