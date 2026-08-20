@@ -672,7 +672,9 @@ PRINTER_TASK_TEMPLATE = r"""---
   register: printer_pnputil_diag
   failed_when: false
   changed_when: false
-  when: printer_pnputil_final.rc | int != 0
+  # pnputil reports 259 when the package is already present and current.
+  # That is a successful, unchanged install rather than a driver import failure.
+  when: printer_pnputil_final.rc | int not in [0, 259]
 
 - name: "{{ printer_key }} | pnputil-Fehler verständlich melden"
   ansible.builtin.fail:
@@ -690,7 +692,7 @@ PRINTER_TASK_TEMPLATE = r"""---
       von der INF referenzierte CAT/CAB/DLL/GPD-Datei. Falls die Meldung einen
       unbekannten Herausgeber nennt, prüfe Publisher/Thumbprint und die lokale
       TrustedPublisher-Richtlinie.
-  when: printer_pnputil_final.rc | int != 0
+  when: printer_pnputil_final.rc | int not in [0, 259]
 
 - name: "{{ printer_key }} | Treiber, TCP/IP-Port und Druckerqueue sicherstellen"
   ansible.windows.win_powershell:
