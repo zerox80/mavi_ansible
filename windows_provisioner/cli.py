@@ -1745,7 +1745,14 @@ Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im int
     )
     p_swr.add_argument("host", help="Inventory-Hostname; OpenSSH muss auf Windows erreichbar sein")
     p_swr.add_argument("--key", help="Alternativer privater SSH-Key für den Rückbau")
-    p_swr.add_argument("--port", type=int, help="SSH-Port für den Rückbau; Standard aus der Konfiguration")
+    p_swr.add_argument(
+        "--port",
+        type=int,
+        help=(
+            "SSH-Port für den Rückbau; bei älteren PSRP-Hosts ohne gespeicherten "
+            "mavi_ssh_port zwingend explizit angeben"
+        ),
+    )
     p_swr.add_argument(
         "--disable-openssh",
         action="store_true",
@@ -1761,9 +1768,20 @@ Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im int
 
     p_ss = ssh_sub.add_parser(
         "status",
-        help="Lokalen SSH-/Ansible-Status und optional einen Host anzeigen",
+        help="Mavi-Remote-Verwaltungsstatus für einen Host oder das gesamte Inventory anzeigen",
     )
     p_ss.add_argument("host", nargs="?", help="Optionaler Inventory-Hostname")
+    p_ss.add_argument(
+        "--all",
+        dest="all_hosts",
+        action="store_true",
+        help="Status für alle Windows-Hosts im Inventory anzeigen",
+    )
+    p_ss.add_argument(
+        "--live",
+        action="store_true",
+        help="zusätzlich einen ausschließlich lesenden Remote-Audit ausführen",
+    )
     p_ss.add_argument("--key", help="Alternativer privater SSH-Key")
     p_ss.set_defaults(func=cmd_ssh_status)
 

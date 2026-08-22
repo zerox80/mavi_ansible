@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.9-oss
+
+- `ping` verwendet nun dieselbe private, vorab geprüfte Kerberos-Sitzung und denselben kurzlebigen Ticket-Cache wie die übrigen Client-Aktionen; ein temporäres Ein-Host-Inventar verhindert dabei Ansible-Pattern-Erweiterungen.
+- Mehrdeutige Remote-Ergebnismarker und unvollständige v2-Bootstrap-Instanznachweise brechen vor jeder Zustandsübernahme oder instanzbezogenen Bereinigung sicher ab.
+
+## 0.9.8-oss
+
+- Inventar- und livebasierten, strikt lesenden Remote-Verwaltungs-Audit für einzelne Windows-Hosts oder das gesamte Inventory ergänzt.
+- WinRM-, OpenSSH-, Firewall- und Zertifikatszustände werden gegen exakt controllerseitig belegte Mavi-Identitäten klassifiziert.
+- Den vollständigen Remote-Rückbau auf exakt identifizierte Listener, Zertifikate, Schlüssel und Controller-Artefakte begrenzt und mit prüfbaren Rückbau-Nachweisen sowie Rollback abgesichert.
+- Historische Bootstrap-CAs, ältere Host-Aliase sowie getrennte PSRP- und SSH-Ports werden sicher und rückwärtskompatibel behandelt.
+- Neue CLI-Varianten `ssh status --all` und `ssh status [HOST|--all] --live` ergänzt.
+
 ## 0.9.7-oss
 
 - Windows-Client-Menü zum Deaktivieren des Schnellstarts bei erhaltenem Ruhezustand und zum getrennten Einstellen der Bildschirmtimeouts für Netz- und Akkubetrieb ergänzt.

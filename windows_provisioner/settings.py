@@ -9,7 +9,7 @@ from ._dependencies import (
     os,
 )
 
-VERSION = "0.9.7"
+VERSION = "0.9.9"
 DEFAULT_CLIENT_UNINSTALL_TIMEOUT_MINUTES = 45
 # Ein neues Projekt wird bewusst außerhalb des Quell-Repositorys angelegt.
 # So bleiben Umgebungswerte, Inventories, Zertifikate und Secrets getrennt
