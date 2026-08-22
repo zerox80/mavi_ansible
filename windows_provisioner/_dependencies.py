@@ -7,6 +7,10 @@ from __future__ import annotations
 
 import argparse
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from datetime import datetime, timezone
+
 import base64
 
 import binascii
@@ -87,6 +91,7 @@ __all__ = (
     "base64",
     "binascii",
     "csv",
+    "datetime",
     "getpass",
     "hashlib",
     "html",
@@ -106,7 +111,10 @@ __all__ = (
     "sys",
     "tempfile",
     "threading",
+    "ThreadPoolExecutor",
     "time",
+    "timezone",
     "urllib",
+    "as_completed",
     "yaml",
 )

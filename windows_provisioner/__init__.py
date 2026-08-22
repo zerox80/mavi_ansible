@@ -6,6 +6,20 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.9 binds the standalone connectivity check to the same private,
+pre-validated Kerberos session as installation and client actions. ``win_ping``
+uses the detected Ansible Python runtime and a short-lived ticket cache while
+named inventory credentials are overlaid with empty values. A temporary
+single-host inventory prevents pattern-like aliases from expanding the target
+set. The temporary inventory, Vault file and Kerberos cache are always removed
+after the ping. Ambiguous remote-result markers and incomplete verified v2
+bootstrap instance state now fail closed before cleanup state is committed.
+
+v0.9.8 adds inventory and live remote-management audits for individual hosts
+or the complete Windows inventory. The live check is strictly read-only and
+classifies WinRM, OpenSSH, Mavi certificates and the documented reset state
+through the host's current management transport.
+
 v0.9.7 adds a Windows-client workflow for managing Fast Startup and separate
 AC/DC monitor timeouts, plus searchable multi-selection and sequential silent
 uninstallation of classic programs. Every action and reachability check stays

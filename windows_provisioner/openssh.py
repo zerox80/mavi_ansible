@@ -7,8 +7,11 @@ from __future__ import annotations
 from ._dependencies import (
     Any,
     Path,
+    ThreadPoolExecutor,
     argparse,
+    as_completed,
     base64,
+    datetime,
     getpass,
     hashlib,
     ipaddress,
@@ -23,6 +26,7 @@ from ._dependencies import (
     sys,
     tempfile,
     time,
+    timezone,
     urllib,
     yaml,
 )
@@ -65,6 +69,26 @@ def _known_host_present(known_hosts: Path, host: str, port: int) -> bool:
     except OSError:
         return False
     return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
+def _ssh_host_key_port(
+    windows: dict[str, Any],
+    host_data: dict[str, Any],
+    configured_port: Any,
+) -> int:
+    """SSH-Port unabhängig vom derzeit aktiven Ansible-Transport bestimmen."""
+    from .remote import _connection_label, _effective_host_var
+
+    raw_port = host_data.get("mavi_ssh_port")
+    if raw_port is None and _connection_label(windows, host_data) == "SSH":
+        raw_port = _effective_host_var(windows, host_data, "ansible_port", None)
+    if raw_port is None:
+        raw_port = configured_port
+    try:
+        port = int(raw_port or 22)
+    except (TypeError, ValueError):
+        port = 22
+    return port if 1 <= port <= 65535 else 22
 
 
 def _fingerprint_known_host_line(line: str) -> str:
@@ -736,6 +760,64 @@ def _bootstrap_instance_id(project: Path, config: dict[str, Any] | None = None) 
     return f"{readable}-{path_digest}"
 
 
+def _openssh_artifact_instance_id(
+    project: Path,
+    host_data: dict[str, Any] | None = None,
+) -> str:
+    """Die exakte Bootstrap-Instanz für hostseitige OpenSSH-Artefakte bestimmen."""
+    state = host_data.get("mavi_bootstrap") if isinstance(host_data, dict) else None
+    if isinstance(state, dict):
+        instance_id = str(state.get("instance_id", "") or "").strip()
+        try:
+            version = int(state.get("version", 1))
+        except (TypeError, ValueError):
+            version = 1
+        if instance_id:
+            if (
+                version < 2
+                or state.get("remote_verified") is not True
+                or re.fullmatch(r"[a-z0-9-]{1,64}", instance_id) is None
+            ):
+                raise ValueError(
+                    "Die gespeicherte Bootstrap-Instanz ist nicht als gültiger "
+                    "hostgebundener v2-Nachweis verifiziert."
+                )
+            return instance_id
+        if version >= 2 or state.get("remote_verified") is True:
+            raise ValueError(
+                "Der gespeicherte Bootstrap-v2-Nachweis enthält keine "
+                "hostgebundene Instanzkennung."
+            )
+    return _bootstrap_instance_id(project)
+
+
+def _openssh_firewall_rule_name(
+    project: Path,
+    *,
+    instance_id: str = "",
+) -> str:
+    resolved_instance_id = str(instance_id or _bootstrap_instance_id(project)).strip()
+    if re.fullmatch(r"[a-z0-9-]{1,64}", resolved_instance_id) is None:
+        raise ValueError("Die Bootstrap-Instanzkennung für die OpenSSH-Firewallregel ist ungültig.")
+    return f"Mavi-OpenSSH-{resolved_instance_id}-Ansible-In-TCP"
+
+
+def _openssh_config_backup_relative_path(
+    project: Path,
+    *,
+    instance_id: str = "",
+) -> str:
+    resolved_instance_id = str(instance_id or _bootstrap_instance_id(project)).strip()
+    if re.fullmatch(r"[a-z0-9-]{1,64}", resolved_instance_id) is None:
+        raise ValueError(
+            "Die Bootstrap-Instanzkennung für die OpenSSH-Konfigurationssicherung ist ungültig."
+        )
+    return (
+        "MaviProvisioner\\bootstrap\\"
+        f"{resolved_instance_id}\\sshd_config.pre-mavi.bak"
+    )
+
+
 def _bootstrap_settings(project: Path) -> dict[str, Any]:
     """Zentrale HTTPS-Bootstrap-Konfiguration validieren und normalisieren."""
     from .environment import get_config
@@ -992,6 +1074,7 @@ def _bootstrap_pki_paths(project: Path) -> dict[str, Path]:
     return {
         "root": root,
         "pki": pki,
+        "ca_archive": root / "trusted-roots",
         "ca_key": pki / "mavi-bootstrap-root-ca.key.pem",
         "ca_cert": pki / "mavi-bootstrap-root-ca.cert.pem",
         "server_key": pki / "mavi-bootstrap-server.key.pem",
@@ -1239,6 +1322,11 @@ def _create_or_reuse_bootstrap_ca(
             "Mavi rotiert die Vertrauenswurzel absichtlich nicht still. Backup wiederherstellen."
         )
     rotation_archive: Path | None = None
+    if rotate and ca_cert.exists():
+        # Die alte Root vor dem recoverable Voll-PKI-Archiv zusätzlich in den
+        # dauerhaften DER-Index übernehmen. Andernfalls wäre bei der ersten
+        # Rotation nach einem Upgrade nur die neue Root exakt löschbar.
+        _archive_bootstrap_root_ca(paths)
     if rotate and (ca_cert.exists() or ca_key.exists()):
         rotation_archive = _archive_bootstrap_pki_for_rotation(paths)
     elif ca_cert.exists():
@@ -1278,6 +1366,106 @@ def _create_or_reuse_bootstrap_ca(
         )
         os.chmod(ca_cert, 0o644)
     return created, rotation_archive
+
+
+def _archive_bootstrap_root_ca(paths: dict[str, Path]) -> str:
+    """Aktuelle Bootstrap-CA in einem root-kontrollierten DER-Archiv binden."""
+    from .environment import die
+    from .remote import (
+        _certificate_der_from_file,
+        _certificate_thumbprint_from_der,
+    )
+
+    try:
+        certificate_der = _certificate_der_from_file(paths["ca_cert"])
+        thumbprint = _certificate_thumbprint_from_der(certificate_der)
+        archive = paths["ca_archive"]
+        archive.mkdir(parents=True, exist_ok=True)
+        if archive.is_symlink() or not archive.is_dir():
+            raise ValueError("Das Bootstrap-CA-Archiv ist kein regulärer Ordner.")
+        if os.name != "nt":
+            os.chmod(archive, 0o755)
+        destination = archive / f"{thumbprint}.cer"
+        if destination.exists():
+            if destination.is_symlink() or not destination.is_file():
+                raise ValueError("Der archivierte Bootstrap-CA-Pfad ist keine reguläre Datei.")
+            archived_der = _certificate_der_from_file(destination)
+            if not secrets.compare_digest(archived_der, certificate_der):
+                raise ValueError(
+                    "Das Bootstrap-CA-Archiv enthält unter demselben Thumbprint andere DER-Daten."
+                )
+        else:
+            _atomic_write_bytes(destination, certificate_der, mode=0o644)
+        return thumbprint
+    except (OSError, ValueError) as exc:
+        die(f"Die aktuelle Mavi-Bootstrap-CA konnte nicht sicher archiviert werden: {exc}")
+    raise AssertionError("unreachable")
+
+
+def _controller_bound_bootstrap_root_certificates(
+    paths: dict[str, Path] | None = None,
+    *,
+    project: Path | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Aktuelle und archivierte Bootstrap-Roots aus Controller-DER ableiten."""
+    from .remote import (
+        _certificate_der_from_file,
+        _certificate_thumbprint_from_der,
+    )
+
+    if paths is None:
+        if project is None:
+            raise ValueError(
+                "Bootstrap-Root-Zertifikate müssen an ein Mavi-Projekt gebunden werden."
+            )
+        resolved_paths = _bootstrap_pki_paths(project)
+    else:
+        resolved_paths = paths
+    current_der: bytes | None = None
+    for candidate in (resolved_paths["system_ca"], resolved_paths["ca_cert"]):
+        if not candidate.is_file():
+            continue
+        certificate_der = _certificate_der_from_file(candidate)
+        if current_der is not None and not secrets.compare_digest(
+            current_der,
+            certificate_der,
+        ):
+            raise ValueError(
+                "Die aktuellen Controller-Kopien der Mavi-Bootstrap-CA widersprechen sich."
+            )
+        current_der = certificate_der
+    if current_der is None:
+        raise ValueError(
+            "Die aktuelle Mavi-Bootstrap-CA ist auf dem Controller nicht lesbar."
+        )
+
+    current_thumbprint = _certificate_thumbprint_from_der(current_der)
+    certificates: dict[str, str] = {
+        current_thumbprint: base64.b64encode(current_der).decode("ascii")
+    }
+    archive = resolved_paths["ca_archive"]
+    if archive.exists():
+        if archive.is_symlink() or not archive.is_dir():
+            raise ValueError("Das Controller-Archiv der Bootstrap-CAs ist kein regulärer Ordner.")
+        for candidate in sorted(archive.glob("*.cer"), key=lambda path: path.name):
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(
+                    f"Der archivierte Bootstrap-CA-Pfad ist keine reguläre Datei: {candidate}"
+                )
+            certificate_der = _certificate_der_from_file(candidate)
+            thumbprint = _certificate_thumbprint_from_der(certificate_der)
+            if candidate.stem.upper() != thumbprint:
+                raise ValueError(
+                    f"Archivname und DER-Thumbprint der Bootstrap-CA stimmen nicht überein: {candidate}"
+                )
+            encoded = base64.b64encode(certificate_der).decode("ascii")
+            existing = certificates.get(thumbprint)
+            if existing is not None and not secrets.compare_digest(existing, encoded):
+                raise ValueError(
+                    "Das Controller-Archiv enthält kollidierende Bootstrap-CA-Identitäten."
+                )
+            certificates[thumbprint] = encoded
+    return current_thumbprint, certificates
 
 
 def _issue_bootstrap_server_certificate(settings: dict[str, Any], paths: dict[str, Path]) -> None:
@@ -1861,6 +2049,7 @@ def cmd_ssh_server_setup(args: argparse.Namespace) -> None:
         paths,
         rotate=rotate_ca,
     )
+    archived_ca_thumbprint = _archive_bootstrap_root_ca(paths)
     _issue_bootstrap_server_certificate(settings, paths)
     _trust_bootstrap_ca_locally(paths)
 
@@ -1923,6 +2112,7 @@ def cmd_ssh_server_setup(args: argparse.Namespace) -> None:
         "firewall": firewall_state,
         "ca_sha256": _sha256_file(paths["ca_cert"]),
         "ca_windows_thumbprint": _certificate_sha1_thumbprint(paths["ca_cert"]),
+        "ca_thumbprint": archived_ca_thumbprint,
         "ca_validity_days": settings["ca_validity_days"],
         "server_cert_validity_days": settings["server_cert_validity_days"],
         "ca_created": ca_created,
@@ -1953,7 +2143,10 @@ def _ensure_automatic_https_server(project: Path) -> dict[str, Any]:
     files_ready = all(
         path.exists()
         for path in (
-            paths["system_ca"], paths["nginx_config"], paths["state"],
+            paths["system_ca"],
+            paths["ca_archive"],
+            paths["nginx_config"],
+            paths["state"],
         )
     )
     if files_ready and hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -1970,6 +2163,9 @@ def _ensure_automatic_https_server(project: Path) -> dict[str, Any]:
             state = json.loads(paths["state"].read_text(encoding="utf-8"))
             if not isinstance(state, dict):
                 raise ValueError("Ungültiger Mavi-Serverstatus")
+            current_ca_thumbprint, _controller_roots = (
+                _controller_bound_bootstrap_root_certificates(paths)
+            )
             state_ready = (
                 state.get("instance_id") == settings["instance_id"]
                 and state.get("project") == str(project.resolve())
@@ -1981,6 +2177,7 @@ def _ensure_automatic_https_server(project: Path) -> dict[str, Any]:
                 and state.get("allowed_cidrs") == settings["allowed_cidrs"]
                 and state.get("ca_validity_days") == settings["ca_validity_days"]
                 and state.get("server_cert_validity_days") == settings["server_cert_validity_days"]
+                and state.get("ca_thumbprint") == current_ca_thumbprint
             )
             nginx_ready = paths["nginx_config"].read_text(encoding="utf-8") == _nginx_bootstrap_config(
                 settings,
@@ -2533,11 +2730,12 @@ def _publish_https_ssh_bootstrap(
     public_key: str,
     msi_raw: str = "",
 ) -> dict[str, str]:
+    from .remote import _certificate_thumbprint_from_der, _safe_host_token
     from .settings import VERSION
 
     settings = _bootstrap_settings(project)
     webroot: Path = settings["local_dir"]
-    safe_host = re.sub(r"[^A-Za-z0-9._-]+", "_", str(host or "WINDOWS")).strip("._-") or "WINDOWS"
+    safe_host = _safe_host_token(host)
     host_dir = webroot / safe_host
     local_msi: Path | None = None
     if msi_raw:
@@ -2606,6 +2804,7 @@ def _publish_https_ssh_bootstrap(
         bootstrap_ca_thumbprint=ca_windows_thumbprint,
     ).encode("utf-8-sig")
     ps1_sha256 = hashlib.sha256(ps1_bytes).hexdigest()
+    ca_thumbprint = _certificate_thumbprint_from_der(ca_der)
     launcher_bytes = _https_ssh_bootstrap_cmd(
         ps1_url,
         ps1_sha256,
@@ -2640,6 +2839,7 @@ def _publish_https_ssh_bootstrap(
         "expected_signer": settings["expected_signer"],
         "ca_der_sha256": hashlib.sha256(ca_der).hexdigest(),
         "ca_windows_thumbprint": ca_windows_thumbprint,
+        "ca_thumbprint": ca_thumbprint,
         "instance_id": settings["instance_id"],
         "offline_launcher": str(offline_launcher),
         "windows_launcher": windows_launcher,
@@ -2664,6 +2864,7 @@ def _publish_https_ssh_bootstrap(
         "delivery_note": delivery_note,
         "ca_der_sha256": hashlib.sha256(ca_der).hexdigest(),
         "ca_windows_thumbprint": ca_windows_thumbprint,
+        "ca_thumbprint": ca_thumbprint,
         "instance_id": settings["instance_id"],
         "ps1_url": ps1_url,
         "ps1_sha256": ps1_sha256,
@@ -2849,10 +3050,11 @@ def cmd_ssh_guide(args: argparse.Namespace) -> None:
     host_ip = "<IP-DES-LAPTOPS>"
     ansible_user = r"<DOMÄNE\Provisioning-Admin>"
     if getattr(args, "host", None):
-        inv, windows, host_data = _host_inventory_entry(args.project, host)
-        del inv
+        _inventory, windows, host_data = _host_inventory_entry(args.project, host)
         host_ip = str(host_data.get("ansible_host", "") or host)
-        ansible_user = str(_effective_host_var(windows, host_data, "ansible_user", ansible_user) or ansible_user)
+        ansible_user = str(
+            _effective_host_var(windows, host_data, "ansible_user", ansible_user) or ansible_user
+        )
 
     print("\nMavi OPENSSH-EINRICHTUNG FÜR WINDOWS")
     print("==================================")
@@ -2994,6 +3196,7 @@ def cmd_ssh_use(args: argparse.Namespace) -> None:
 
 def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
     """WinRM ausschließlich aus einer bestehenden Mavi-SSH-Key-Sitzung heraus härten."""
+
     from .environment import (
         atomic_write_yaml,
         die,
@@ -3003,9 +3206,13 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
     from .execution import create_temporary_vault_password_file
     from .remote import (
         _apply_psrp_https_transport,
+        _bootstrap_ca_probe_play,
+        _certificate_thumbprint_from_file,
         _effective_host_var,
         _ensure_psrp_kerberos_controller_dependencies,
+        _extract_bootstrap_ca_probe_result,
         _extract_winrm_csr,
+        _extract_winrm_https_install_result,
         _host_inventory_entry,
         _is_missing_gssapi_failure,
         _issue_winrm_server_certificate,
@@ -3013,7 +3220,9 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
         _prepare_kerberos_runtime_config,
         _psrp_https_inventory_vars,
         _remember_winrm_https_state,
+        _remove_host_winrm_certificate_artifacts,
         _run_winrm_temporary_play,
+        _utc_now_iso,
         _vault_ansible_user_for_host,
         _winrm_csr_play,
         _winrm_https_settings,
@@ -3022,7 +3231,6 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
         _winrm_kerberos_https_ping_play,
     )
     from .reports import redact_sensitive_text
-
     ensure_initialized(args.project, quiet=True)
     inv, windows, host_data = _host_inventory_entry(args.project, args.host)
     connection = str(_effective_host_var(windows, host_data, "ansible_connection", "") or "").lower()
@@ -3034,6 +3242,19 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
 
     try:
         bootstrap = _bootstrap_settings(args.project)
+        (
+            current_bootstrap_thumbprint,
+            controller_bootstrap_certificates,
+        ) = _controller_bound_bootstrap_root_certificates(project=args.project)
+        current_bootstrap_certificate = controller_bootstrap_certificates[
+            current_bootstrap_thumbprint
+        ]
+        current_bootstrap_ca_sha256 = hashlib.sha256(
+            base64.b64decode(current_bootstrap_certificate, validate=True)
+        ).hexdigest()
+        bootstrap_probe_candidates = list(
+            controller_bootstrap_certificates.values()
+        )
         settings = _winrm_https_settings(args.project)
         identity = _winrm_https_target_identity(args.host, host_data, settings)
         _, kdc_endpoints = _prepare_kerberos_runtime_config(args.project, settings)
@@ -3082,6 +3303,33 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
         print(f"TCP/5986 nur von:  {bootstrap['ansible_server_ip']}")
         print("HTTP/5985:         wird per SSH entfernt; es gibt keinen NTLM-Rückweg.")
 
+        bootstrap_probe_output = _run_winrm_temporary_play(
+            args.project,
+            host=args.host,
+            play=_bootstrap_ca_probe_play(
+                current_root_certificate_der_base64=current_bootstrap_certificate,
+                candidate_root_certificates_der_base64=bootstrap_probe_candidates,
+            ),
+            vault_password_file=vault_file,
+            description="Hostgebundener Bootstrap-CA-Nachweis über SSH",
+        )
+        bootstrap_probe_result = _extract_bootstrap_ca_probe_result(
+            bootstrap_probe_output
+        )
+        if bootstrap_probe_result["current_root_thumbprint"] != current_bootstrap_thumbprint:
+            raise RuntimeError(
+                "SICHERHEITSABBRUCH: Der Zielhost bestätigt nicht die aktuell veröffentlichte "
+                "Mavi-Bootstrap-CA."
+            )
+        unexpected_bootstrap_roots = set(
+            bootstrap_probe_result["present_root_thumbprints"]
+        ) - set(controller_bootstrap_certificates)
+        if unexpected_bootstrap_roots:
+            raise RuntimeError(
+                "SICHERHEITSABBRUCH: Der Zielhost meldet eine Bootstrap-CA, die nicht "
+                "durch DER-Material auf dem Controller gebunden ist."
+            )
+
         request_id = secrets.token_hex(16)
         csr_output = _run_winrm_temporary_play(
             args.project,
@@ -3097,7 +3345,7 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
             identity=identity,
             csr_pem=csr_pem,
         )
-        _run_winrm_temporary_play(
+        install_output = _run_winrm_temporary_play(
             args.project,
             host=args.host,
             play=_winrm_install_https_play(
@@ -3112,6 +3360,25 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
             vault_password_file=vault_file,
             description="WinRM-HTTPS-Installation über SSH",
         )
+        install_result = _extract_winrm_https_install_result(install_output)
+        expected_root_thumbprint = _certificate_thumbprint_from_file(Path(issued["ca_der"]))
+        if not secrets.compare_digest(
+            install_result["certificate_sha256"],
+            str(issued["cert_sha256"]).strip().lower(),
+        ):
+            raise RuntimeError(
+                "SICHERHEITSABBRUCH: Der Windows-Abschlussbeleg gehört nicht zum gerade signierten "
+                "Mavi-WinRM-Serverzertifikat."
+            )
+        if (
+            install_result["fqdn"] != str(identity["fqdn"]).lower()
+            or install_result["port"] != int(settings["port"])
+            or install_result["root_thumbprint"] != expected_root_thumbprint
+        ):
+            raise RuntimeError(
+                "SICHERHEITSABBRUCH: Der Windows-Abschlussbeleg stimmt nicht mit dem erwarteten "
+                "Mavi-WinRM-Endpunkt bzw. der Mavi-Root-CA überein."
+            )
 
         # HTTP/5985 wird bereits innerhalb derselben abgeschotteten Windows-
         # Transaktion entfernt, bevor Negotiate endgültig deaktiviert wird.
@@ -3165,6 +3432,12 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
             kerberos_principal=kerberos_principal,
             kerberos_target_fqdn=identity["fqdn"],
         )
+        removed_controller_artifacts, artifact_warnings = _remove_host_winrm_certificate_artifacts(
+            args.project,
+            args.host,
+            keep_request_id=str(issued["request_id"]),
+            known_hosts=(windows.get("hosts", {}) or {}).keys(),
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         print("\nSICHERHEITSABBRUCH: WinRM wurde nicht als Mavi-Transport übernommen.")
         print(redact_sensitive_text(exc))
@@ -3173,12 +3446,30 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
     finally:
         vault_file.unlink(missing_ok=True)
 
+    # Erst die direkte Windows-Abfrage über die funktionierende SSH-Sitzung
+    # bindet Bootstrap-Identitäten an diesen Host. Frühere, nur aufgrund von
+    # Webserver-Probes erzeugte v1-Einträge werden dabei nicht blind vertraut;
+    # sie wandern nur dann in die Historie, wenn Windows sie exakt bestätigt.
+    host_data["mavi_bootstrap"] = {
+        "version": 2,
+        "remote_verified": True,
+        "instance_id": bootstrap["instance_id"],
+        "root_thumbprint": bootstrap_probe_result["current_root_thumbprint"],
+        "root_thumbprints": bootstrap_probe_result["present_root_thumbprints"],
+        "ca_sha256": current_bootstrap_ca_sha256,
+        "verified_at": _utc_now_iso(),
+    }
     _remember_winrm_https_state(
         host_data,
         settings=settings,
         fqdn=identity["fqdn"],
         ca_cert=Path(issued["ca_cert"]),
         kerberos_principal=kerberos_principal,
+        certificate_thumbprint=install_result["thumbprint"],
+        certificate_not_after=install_result["certificate_not_after"],
+        root_thumbprint=install_result["root_thumbprint"],
+        root_not_after=install_result["root_not_after"],
+        pruned_server_certificates=install_result["pruned_server_certificates"],
     )
     _apply_psrp_https_transport(
         host_data,
@@ -3194,10 +3485,142 @@ def cmd_ssh_winrm_https(args: argparse.Namespace) -> None:
     print("  PSRP:             HTTPS:5986, Zertifikat validiert, Kerberos-only")
     print(f"  Inventory-Host:   {args.host} wurde dauerhaft auf sicheren PSRP umgestellt")
     print(f"  SSH:              bleibt installiert und aktiv als separater Verwaltungsweg")
+    print(f"  Leaf-Thumbprint:  {install_result['thumbprint']}")
+    print(f"  Leaf-Ablauf:      {install_result['certificate_not_after']}")
+    print(f"  Alte Leaf-Zertifikate auf Windows: {install_result['pruned_server_certificates']} entfernt")
+    print(f"  Alte Host-PKI-Dateien auf Controller: {removed_controller_artifacts} entfernt")
+    for warning in artifact_warnings:
+        print(f"! {warning}")
+
+
+def _winrm_reset_root_identity(
+    winrm_state: Any,
+    *,
+    ca_cert: Path,
+    ca_der: Path,
+) -> tuple[str, str]:
+    """Exakte Root-Identität für den Rückbau bestimmen, v1-Hashes inklusive."""
+    from .remote import (
+        _certificate_der_base64_from_file,
+        _certificate_thumbprint_from_file,
+        _normalized_certificate_thumbprint,
+    )
+
+    state = winrm_state if isinstance(winrm_state, dict) else None
+    stored_root_thumbprint = (
+        _normalized_certificate_thumbprint(state.get("root_thumbprint"))
+        if state is not None
+        else ""
+    )
+    if not ca_der.is_file():
+        if stored_root_thumbprint:
+            raise ValueError(
+                "Für die gespeicherte Mavi-WinRM-Root fehlt das controllerseitige DER; "
+                "ein Inventory-Thumbprint allein ist keine Löschberechtigung."
+            )
+        return "", ""
+
+    controller_root_thumbprint = _certificate_thumbprint_from_file(ca_der)
+    if stored_root_thumbprint and controller_root_thumbprint != stored_root_thumbprint:
+        raise ValueError(
+            "Die gespeicherte historische Mavi-WinRM-Root stimmt nicht mit dem "
+            "controllerseitigen DER überein; ein Thumbprint allein darf keine Root löschen."
+        )
+
+    if state is not None and not stored_root_thumbprint:
+        # v1 kannte noch keinen Root-Thumbprint. Sein Hash bezog sich auf die
+        # PEM-Datei der Controller-CA. Nur ein exakter Hash-Treffer darf diese
+        # alte Aufzeichnung auf die heutige Thumbprint-Identität hochstufen.
+        expected_hash = str(state.get("ca_sha256", "") or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", expected_hash) or not ca_cert.is_file():
+            raise ValueError(
+                "Der alte Mavi-WinRM-Status enthält keine prüfbare Root-CA-Identität; "
+                "der sichere Rückbau wird verweigert."
+            )
+        actual_hash = _sha256_file(ca_cert).lower()
+        if not secrets.compare_digest(expected_hash, actual_hash):
+            raise ValueError(
+                "Die lokale Mavi-WinRM-CA stimmt nicht mit dem gespeicherten v1-CA-Hash "
+                "dieses Hosts überein; der sichere Rückbau wird verweigert."
+            )
+        if _certificate_thumbprint_from_file(ca_cert) != controller_root_thumbprint:
+            raise ValueError(
+                "PEM- und DER-Datei der lokalen Mavi-WinRM-CA bezeichnen nicht dieselbe Root; "
+                "der sichere Rückbau wird verweigert."
+            )
+
+    return (
+        controller_root_thumbprint,
+        _certificate_der_base64_from_file(ca_der),
+    )
+
+
+def _winrm_leaf_fqdn_for_host(
+    project: Path,
+    host: str,
+    host_data: dict[str, Any],
+) -> str:
+    """Den hostgebundenen FQDN für Mavi-WinRM-Leaves bestimmen.
+
+    Ein gespeicherter, bereits geprüfter Endpunkt hat beim Rückbau Vorrang:
+    Eine zwischenzeitlich geänderte globale Domänenkonfiguration darf den
+    Lösch-Scope nicht auf einen anderen Hostnamen verschieben.
+    """
+    from .remote import (
+        _normalize_winrm_dns_name,
+        _winrm_https_settings,
+        _winrm_https_target_identity,
+    )
+
+    state = host_data.get("mavi_winrm_https")
+    if isinstance(state, dict):
+        saved_fqdn = str(state.get("fqdn", "") or "").strip()
+        if saved_fqdn:
+            return _normalize_winrm_dns_name(
+                saved_fqdn,
+                label="gespeicherter WinRM-FQDN",
+            )
+
+    settings = _winrm_https_settings(project)
+    identity = _winrm_https_target_identity(host, host_data, settings)
+    return str(identity["fqdn"])
+
+
+def _bootstrap_state_thumbprints(state: Any) -> tuple[str, ...]:
+    """Exakte, deduplizierte Thumbprints aus einem Bootstrap-Status lesen."""
+    from .remote import _normalized_certificate_thumbprint
+
+    if not isinstance(state, dict):
+        return ()
+    raw_values = state.get("root_thumbprints")
+    if not isinstance(raw_values, list):
+        raw_values = []
+    values = [state.get("root_thumbprint"), *raw_values]
+    normalized: list[str] = []
+    for value in values:
+        thumbprint = _normalized_certificate_thumbprint(value)
+        if thumbprint and thumbprint not in normalized:
+            normalized.append(thumbprint)
+    return tuple(normalized)
+
+
+def _verified_bootstrap_root_thumbprints(host_data: dict[str, Any]) -> tuple[str, ...]:
+    """Nur vom Zielhost selbst bestätigte Bootstrap-Identitäten akzeptieren."""
+    state = host_data.get("mavi_bootstrap")
+    if not isinstance(state, dict):
+        return ()
+    try:
+        version = int(state.get("version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    if version < 2 or state.get("remote_verified") is not True:
+        return ()
+    return _bootstrap_state_thumbprints(state)
 
 
 def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
     """WinRM auf Stand 0 setzen und OpenSSH auf Wunsch als letzten Kanal abschalten."""
+
     from .catalogs import yes_no
     from .environment import (
         atomic_write_yaml,
@@ -3207,20 +3630,27 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
     )
     from .execution import create_temporary_vault_password_file
     from .remote import (
+        _apply_remote_management_disabled_transport,
         _apply_ssh_transport,
+        _bootstrap_ca_probe_play,
         _effective_host_var,
+        _extract_bootstrap_ca_probe_result,
+        _extract_winrm_reset_result,
         _host_inventory_entry,
+        _remove_host_bootstrap_artifacts,
         _remove_host_winrm_certificate_artifacts,
         _run_winrm_temporary_play,
         _ssh_environment_marker,
+        _utc_now_iso,
         _winrm_pki_paths,
         _winrm_reset_play,
+        get_ssh_settings,
     )
     from .reports import redact_sensitive_text
-
     ensure_initialized(args.project, quiet=True)
     inv, windows, host_data = _host_inventory_entry(args.project, args.host)
     disable_openssh = bool(getattr(args, "disable_openssh", False))
+    had_winrm_https_state = isinstance(host_data.get("mavi_winrm_https"), dict)
     connection = str(
         _effective_host_var(windows, host_data, "ansible_connection", "") or ""
     ).lower()
@@ -3229,10 +3659,11 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
         print("\nMavi REMOTE-VERWALTUNG ZURÜCKSETZEN")
         print("====================================")
         print(f"PC:       {args.host}")
-        print("WinRM:    alle Listener, Mavi-Regeln, Mavi-Zertifikate und Richtlinienwerte entfernen")
+        print("WinRM:    nur eindeutig Mavi-Listener, -Regeln, -Zertifikate und Arbeitsdateien entfernen")
         print("           Dienst anschließend stoppen und deaktivieren")
         if disable_openssh:
             print("OpenSSH:  Mavi-Key entfernen, Mavi-Firewallregel entfernen, sshd stoppen/deaktivieren")
+            print("CA:       Mavi Bootstrap Root CA nur bei bytegleichem Controller-DER entfernen")
             print("! Danach gibt es keinen Mavi-Fernzugang mehr. Neueinrichtung nur lokal per Starter.")
         else:
             print("OpenSSH:  bleibt als sofortiger Weg für eine neue WinRM-Einrichtung aktiv")
@@ -3242,7 +3673,34 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
 
     requested_key = getattr(args, "key", None)
     requested_port = getattr(args, "port", None)
+    if connection != "ssh" and not str(requested_key or "").strip():
+        remembered_key = str(
+            host_data.get("mavi_ssh_private_key_file", "") or ""
+        ).strip()
+        if remembered_key:
+            requested_key = remembered_key
+    if connection != "ssh" and requested_port is None:
+        remembered_port = host_data.get("mavi_ssh_port")
+        try:
+            remembered_port = int(remembered_port)
+        except (TypeError, ValueError):
+            remembered_port = 0
+        if not 1 <= remembered_port <= 65535:
+            die(
+                f"Für den bestehenden PSRP-/WinRM-Host {args.host} ist kein verlässlicher "
+                "historischer SSH-Port gespeichert. Bitte den tatsächlich erreichbaren Port "
+                "einmal explizit mit --port angeben; Mavi rät nicht den globalen Standard: "
+                f"mavi-provisioner ssh winrm-reset {args.host} --port PORT"
+            )
+        requested_port = remembered_port
     if connection != "ssh" or requested_key is not None or requested_port is not None:
+        resolved_port = requested_port
+        if resolved_port is None:
+            resolved_port = _ssh_host_key_port(
+                windows,
+                host_data,
+                get_ssh_settings(args.project)["port"],
+            )
         if connection != "ssh":
             print(f"\n{args.host} wird zuerst über den vorhandenen Mavi-Key auf OpenSSH umgestellt.")
         cmd_ssh_use(
@@ -3250,7 +3708,7 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
                 project=args.project,
                 host=args.host,
                 key=requested_key,
-                port=requested_port,
+                port=resolved_port,
                 yes=bool(getattr(args, "yes", False)),
             )
         )
@@ -3259,37 +3717,124 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
     reset_public_key_prefix = ""
     reset_key_marker = ""
     openssh_firewall_rule = ""
+    openssh_config_backup = ""
+    bootstrap_root_thumbprints: tuple[str, ...] = ()
+    bootstrap_root_certificates: tuple[str, ...] = ()
+    bootstrap_probe_current_certificate = ""
+    bootstrap_probe_candidates: tuple[str, ...] = ()
+    controller_bootstrap_certificates: dict[str, str] = {}
+    current_bootstrap_thumbprint = ""
     if disable_openssh:
-        active_key_raw = str(
-            _effective_host_var(windows, host_data, "ansible_ssh_private_key_file", "") or ""
-        ).strip()
-        if active_key_raw:
-            active_key_path = Path(active_key_raw).expanduser().resolve()
-            active_public_key, _ = _public_key_summary(
-                Path(str(active_key_path) + ".pub")
-            )
-            active_key_parts = active_public_key.split()
-            if len(active_key_parts) >= 2:
-                reset_public_key_prefix = f"{active_key_parts[0]} {active_key_parts[1]}"
-        if not reset_public_key_prefix:
-            reset_public_key_prefix = _mavi_public_key_prefix(args.project)
-        reset_key_marker = _ssh_environment_marker(args.project)
-        openssh_firewall_rule = (
-            f"Mavi-OpenSSH-{_bootstrap_instance_id(args.project)}-Ansible-In-TCP"
-        )
-
-    root_thumbprint = ""
-    ca_der = _winrm_pki_paths(args.project)["ca_der"]
-    if ca_der.is_file():
         try:
-            root_thumbprint = hashlib.sha1(
-                ca_der.read_bytes(),
-                usedforsecurity=False,
-            ).hexdigest().upper()
+            (
+                current_bootstrap_thumbprint,
+                controller_bootstrap_certificates,
+            ) = _controller_bound_bootstrap_root_certificates(project=args.project)
         except (OSError, ValueError) as exc:
             die(
-                "Der Fingerabdruck der lokalen Mavi-WinRM-CA konnte nicht gelesen werden: "
-                f"{redact_sensitive_text(exc)}"
+                "Für den vollständigen Rückbau ist kein vertrauenswürdiger controllerseitiger "
+                "Bootstrap-CA-Satz verfügbar: " + redact_sensitive_text(exc)
+            )
+        bootstrap_probe_current_certificate = controller_bootstrap_certificates[
+            current_bootstrap_thumbprint
+        ]
+        bootstrap_probe_candidates = tuple(
+            controller_bootstrap_certificates.values()
+        )
+        stored_bootstrap_thumbprints = _bootstrap_state_thumbprints(
+            host_data.get("mavi_bootstrap")
+        )
+        verified_bootstrap_thumbprints = _verified_bootstrap_root_thumbprints(
+            host_data
+        )
+        if (
+            stored_bootstrap_thumbprints
+            and verified_bootstrap_thumbprints != stored_bootstrap_thumbprints
+        ):
+            die(
+                "Der gespeicherte Bootstrap-CA-Verlauf ist nicht als v2-Remote-Nachweis "
+                "verifiziert und kann keinen vollständigen Lösch-Scope belegen."
+            )
+        unbound_bootstrap_thumbprints = set(
+            verified_bootstrap_thumbprints
+        ) - set(controller_bootstrap_certificates)
+        if unbound_bootstrap_thumbprints:
+            die(
+                "Für mindestens eine vom Host bestätigte historische Bootstrap-CA fehlt "
+                "das exakte DER im root-kontrollierten Controller-Archiv; Option 11 "
+                "schreibt deshalb keinen unvollständigen Rückbau-Nachweis."
+            )
+
+    if disable_openssh:
+        active_key_path = _ssh_private_key_path_for_host(
+            args.project,
+            windows,
+            host_data,
+        )
+        reset_public_key_prefix = _public_key_prefix_for_private_key(active_key_path)
+        if not reset_public_key_prefix:
+            die(
+                "Der aktive SSH-Public-Key kann weder aus der Companion-.pub-Datei "
+                "gelesen noch mit ssh-keygen -y aus dem privaten Key abgeleitet werden. "
+                "Der vollständige Remote-Rückbau wird ohne exakte Key-Identität nicht attestiert."
+            )
+        reset_key_marker = _ssh_environment_marker(args.project)
+        try:
+            openssh_artifact_instance_id = _openssh_artifact_instance_id(
+                args.project,
+                host_data,
+            )
+            openssh_firewall_rule = _openssh_firewall_rule_name(
+                args.project,
+                instance_id=openssh_artifact_instance_id,
+            )
+            openssh_config_backup = _openssh_config_backup_relative_path(
+                args.project,
+                instance_id=openssh_artifact_instance_id,
+            )
+        except ValueError as exc:
+            die(
+                "Der vollständige Rückbau kann den instanzgebundenen Mavi-OpenSSH-Scope "
+                "nicht sicher bestimmen: " + redact_sensitive_text(exc)
+            )
+
+    winrm_state = host_data.get("mavi_winrm_https")
+    pki_paths = _winrm_pki_paths(args.project)
+    try:
+        root_thumbprint, root_certificate_der_base64 = _winrm_reset_root_identity(
+            winrm_state,
+            ca_cert=pki_paths["ca_cert"],
+            ca_der=pki_paths["ca_der"],
+        )
+    except (OSError, ValueError) as exc:
+        die(
+            "Die lokale Mavi-WinRM-CA konnte nicht sicher dem gespeicherten Host-Status "
+            f"zugeordnet werden: {redact_sensitive_text(exc)}"
+        )
+    if had_winrm_https_state and not root_thumbprint:
+        die(
+            "Die zu diesem PC gespeicherte Mavi-WinRM-Verwaltung kann ohne die exakte "
+            "Mavi-WinRM-Root-CA nicht sicher zurückgebaut werden. "
+            "Mavi rät hier weder per Subject noch löscht es pauschal Zertifikate."
+        )
+    if disable_openssh and not root_thumbprint:
+        die(
+            "Der vollständige Option-11-Rückbau benötigt die exakte Mavi-WinRM-Root-Identität. "
+            "Ein leerer WinRM-Listener-Bestand beweist nicht, dass keine verwaisten Mavi-"
+            "Zertifikate mehr vorhanden sind; deshalb wird kein v3-Vollnachweis erzeugt."
+        )
+    expected_winrm_fqdn = ""
+    if root_thumbprint:
+        try:
+            expected_winrm_fqdn = _winrm_leaf_fqdn_for_host(
+                args.project,
+                args.host,
+                host_data,
+            )
+        except (OSError, ValueError) as exc:
+            die(
+                "Der Mavi-WinRM-Ziel-FQDN für den Zertifikats-Rückbau ist nicht "
+                f"verlässlich bestimmbar: {redact_sensitive_text(exc)}"
             )
 
     vault_file: Path | None = None
@@ -3303,15 +3848,63 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
 
     try:
         print("\nRückbau läuft über OpenSSH; das Ergebnis erscheint nach Abschluss (maximal 180 Sekunden).")
-        _run_winrm_temporary_play(
+        if disable_openssh:
+            bootstrap_probe_output = _run_winrm_temporary_play(
+                args.project,
+                host=args.host,
+                play=_bootstrap_ca_probe_play(
+                    current_root_certificate_der_base64=(
+                        bootstrap_probe_current_certificate
+                    ),
+                    candidate_root_certificates_der_base64=list(
+                        bootstrap_probe_candidates
+                    ),
+                    require_current_root=False,
+                ),
+                vault_password_file=vault_file,
+                description="Live-Nachweis des Bootstrap-Lösch-Scope über SSH",
+            )
+            bootstrap_probe_result = _extract_bootstrap_ca_probe_result(
+                bootstrap_probe_output,
+                require_current_root=False,
+            )
+            if (
+                bootstrap_probe_result["current_root_thumbprint"]
+                != current_bootstrap_thumbprint
+            ):
+                raise RuntimeError(
+                    "Der Bootstrap-Nachweis gehört nicht zur aktuellen controllerseitigen CA."
+                )
+            bootstrap_root_thumbprints = tuple(
+                bootstrap_probe_result["present_root_thumbprints"]
+            )
+            unexpected_bootstrap_roots = set(bootstrap_root_thumbprints) - set(
+                controller_bootstrap_certificates
+            )
+            if unexpected_bootstrap_roots:
+                raise RuntimeError(
+                    "Der Bootstrap-Nachweis enthält eine nicht durch Controller-DER "
+                    "gebundene Root-CA."
+                )
+            bootstrap_root_certificates = tuple(
+                controller_bootstrap_certificates[thumbprint]
+                for thumbprint in bootstrap_root_thumbprints
+            )
+        reset_output = _run_winrm_temporary_play(
             args.project,
             host=args.host,
             play=_winrm_reset_play(
                 root_thumbprint=root_thumbprint,
+                root_certificate_der_base64=root_certificate_der_base64,
+                expected_fqdn=expected_winrm_fqdn,
+                bootstrap_root_certificates_der_base64=list(
+                    bootstrap_root_certificates
+                ),
                 disable_openssh=disable_openssh,
                 public_key_prefix=reset_public_key_prefix,
                 key_marker=reset_key_marker,
                 openssh_firewall_rule=openssh_firewall_rule,
+                openssh_config_backup=openssh_config_backup,
             ),
             vault_password_file=vault_file,
             description=(
@@ -3321,6 +3914,28 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
             ),
             timeout=180.0,
         )
+        reset_result = _extract_winrm_reset_result(reset_output)
+        if root_thumbprint and reset_result["winrm_root_thumbprint"] != root_thumbprint:
+            raise RuntimeError(
+                "Der Mavi-Rückbau-Nachweis bestätigt nicht die erwartete Mavi-WinRM-Root-CA."
+            )
+        if disable_openssh:
+            if (
+                tuple(reset_result["bootstrap_root_thumbprints"])
+                != bootstrap_root_thumbprints
+                or not reset_result["bootstrap_scope_verified"]
+                or not reset_result["openssh_startup_disabled"]
+                or not reset_result["openssh_disable_scheduled"]
+                or not reset_result["openssh_stopped_verified"]
+                or reset_result["openssh_state"].casefold() != "stopped"
+                or reset_result["openssh_start_mode"].casefold() != "disabled"
+                or not reset_result["winrm_scope_verified"]
+                or not reset_result["winrm_listeners_cleared"]
+            ):
+                raise RuntimeError(
+                    "Der Mavi-Rückbau-Nachweis bestätigt Bootstrap-CA, leeren WinRM-Listener-"
+                    "Bestand oder den gestoppten/deaktivierten sshd nicht vollständig."
+                )
     except (OSError, RuntimeError, ValueError) as exc:
         print("\nFEHLER: Der Remote-Rückbau wurde nicht vollständig bestätigt.")
         print(redact_sensitive_text(exc))
@@ -3330,6 +3945,24 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
         if vault_file is not None:
             vault_file.unlink(missing_ok=True)
 
+    removed_artifacts, artifact_warnings = _remove_host_winrm_certificate_artifacts(
+        args.project,
+        args.host,
+        known_hosts=(windows.get("hosts", {}) or {}).keys(),
+    )
+    removed_bootstrap_artifacts = 0
+    bootstrap_artifact_warnings: list[str] = []
+    if disable_openssh:
+        removed_bootstrap_artifacts, bootstrap_artifact_warnings = _remove_host_bootstrap_artifacts(
+            args.project,
+            args.host,
+            known_hosts=(windows.get("hosts", {}) or {}).keys(),
+        )
+
+    # Der Inventory-Nachweis wird bewusst erst nach dem vollständigen Remote-
+    # Ergebnis und den ausschließlich hostbezogenen Controller-Bereinigungen
+    # geschrieben. Ein unterbrochener Rückbau erhält daher nie den Status
+    # "vollständig aus".
     inv, windows, host_data = _host_inventory_entry(args.project, args.host)
     current_key_raw = str(
         _effective_host_var(windows, host_data, "ansible_ssh_private_key_file", "") or ""
@@ -3339,34 +3972,95 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
         current_port = int(current_port_raw) if current_port_raw is not None else None
     except (TypeError, ValueError):
         current_port = None
-    _apply_ssh_transport(
-        args.project,
-        host_data,
-        key_path=Path(current_key_raw).expanduser() if current_key_raw else None,
-        port=current_port,
-    )
     host_data.pop("mavi_winrm_https", None)
     host_data.pop("mavi_winrm_fqdn", None)
     if disable_openssh:
+        # Nur die historischen Werte für einen späteren, expliziten
+        # `ssh use`-Schritt behalten. Sie sind keine aktiven Ansible-Variablen.
+        if current_key_raw:
+            host_data["mavi_ssh_private_key_file"] = str(
+                Path(current_key_raw).expanduser().resolve()
+            )
+        if current_port is not None and 1 <= current_port <= 65535:
+            host_data["mavi_ssh_port"] = current_port
+        _apply_remote_management_disabled_transport(host_data)
+
+        all_controller_warnings = [*artifact_warnings, *bootstrap_artifact_warnings]
+        remote_cleanup_verified = (
+            reset_result["winrm_scope_verified"]
+            and reset_result["winrm_listeners_cleared"]
+            and reset_result["bootstrap_scope_verified"]
+            and reset_result["openssh_startup_disabled"]
+            and reset_result["openssh_stopped_verified"]
+            and reset_result["openssh_state"].casefold() == "stopped"
+            and reset_result["openssh_start_mode"].casefold() == "disabled"
+        )
         host_data["mavi_remote_management_disabled"] = {
-            "version": 1,
+            "version": 3,
+            "recorded_at": _utc_now_iso(),
             "winrm": True,
             "openssh": True,
+            "remote_cleanup_verified": remote_cleanup_verified,
+            "winrm_scope_verified": reset_result["winrm_scope_verified"],
+            "winrm_listeners_cleared": reset_result["winrm_listeners_cleared"],
+            "bootstrap_scope_verified": reset_result["bootstrap_scope_verified"],
+            "openssh_stopped_verified": reset_result["openssh_stopped_verified"],
+            "controller_cleanup_complete": not all_controller_warnings,
+            "bootstrap_ca_thumbprint": bootstrap_root_thumbprints[0],
+            "bootstrap_ca_thumbprints": list(bootstrap_root_thumbprints),
+            "winrm_root_thumbprint": reset_result["winrm_root_thumbprint"] or root_thumbprint,
+            "result": {
+                "removed_listeners": reset_result["removed_listeners"],
+                "removed_certificates": reset_result["removed_certificates"],
+                "removed_firewall_rules": reset_result["removed_firewall_rules"],
+                "removed_openssh_firewall_rules": reset_result["removed_openssh_firewall_rules"],
+                "removed_openssh_keys": reset_result["removed_openssh_keys"],
+                "removed_openssh_config_backups": reset_result[
+                    "removed_openssh_config_backups"
+                ],
+                "removed_bootstrap_certificates": reset_result["removed_bootstrap_certificates"],
+                "openssh_state": reset_result["openssh_state"],
+                "openssh_start_mode": reset_result["openssh_start_mode"],
+                "preserved_foreign_winrm_listeners": reset_result[
+                    "preserved_foreign_winrm_listeners"
+                ],
+            },
         }
+        if not bootstrap_artifact_warnings:
+            host_data.pop("mavi_bootstrap", None)
+    else:
+        _apply_ssh_transport(
+            args.project,
+            host_data,
+            key_path=Path(current_key_raw).expanduser() if current_key_raw else None,
+            port=current_port,
+        )
     atomic_write_yaml(project_paths(args.project)["inventory"], inv)
 
-    removed_artifacts, artifact_warnings = _remove_host_winrm_certificate_artifacts(
-        args.project,
-        args.host,
-    )
-
     print("\n✓ Remote-Verwaltungszustand wurde zurückgesetzt.")
-    print("  WinRM:            Listener entfernt, Dienst gestoppt und deaktiviert")
+    if reset_result["winrm_scope_verified"]:
+        print("  WinRM:            Mavi-Listener entfernt, Dienst gestoppt und deaktiviert")
+    else:
+        print("  WinRM:            Dienst gestoppt und deaktiviert; Mavi-CA war nicht exakt belegbar")
+        print("! Mavi hat deshalb keine Zertifikate oder Listener nur anhand ihres Namens gelöscht.")
+    if reset_result["preserved_foreign_winrm_listeners"]:
+        print(
+            "  Fremde WinRM-Listener: "
+            f"{reset_result['preserved_foreign_winrm_listeners']} erhalten (WinRM bleibt deaktiviert)"
+        )
     print("  Kerberos/PSRP:    gespeicherter Hoststatus entfernt; kein persistenter Mavi-Ticketcache")
     print(f"  Host-PKI-Dateien: {removed_artifacts} Datei(en) auf dem Controller entfernt")
-    print("  Gemeinsame CA:    bleibt bestehen, damit andere Windows-PCs weiter funktionieren")
+    print("  Gemeinsame CAs:   bleiben auf dem Controller für andere Windows-PCs erhalten")
     if disable_openssh:
-        print("  OpenSSH:          Mavi-Key entfernt; sshd wird verzögert gestoppt und ist deaktiviert")
+        print(
+            "  Bootstrap-CA:     "
+            f"{reset_result['removed_bootstrap_certificates']} exakt passende CA-Kopie(n) auf Windows entfernt"
+        )
+        print(f"  Bootstrap-Dateien:{removed_bootstrap_artifacts} hostbezogene Datei(en) auf dem Controller entfernt")
+        print(
+            "  OpenSSH:          Mavi-Key/-Regel und Mavi-Konfigurationssicherung entfernt; "
+            "sshd ist nachweislich gestoppt und deaktiviert"
+        )
         print("  Fernzugang:       vollständig aus; OpenSSH bleibt lediglich installiert")
         print("\nFür eine spätere Neueinrichtung zuerst den Mavi-OpenSSH-Starter lokal am PC ausführen.")
         print(f"Danach: mavi-provisioner ssh use {args.host}")
@@ -3374,6 +4068,8 @@ def cmd_ssh_winrm_reset(args: argparse.Namespace) -> None:
         print("  OpenSSH:          bleibt installiert und aktiv")
         print(f"\nWinRM neu einrichten mit: mavi-provisioner ssh winrm-https {args.host}")
     for warning in artifact_warnings:
+        print(f"! {warning}")
+    for warning in bootstrap_artifact_warnings:
         print(f"! {warning}")
 
 
@@ -3403,22 +4099,87 @@ def cmd_ssh_use_psrp(args: argparse.Namespace) -> None:
     print(f"  Benutzer:   {user}")
 
 
-def _mavi_public_key_prefix(project: Path) -> str:
-    """Nur Key-Typ + Base64-Payload, ohne Kommentar, für exakten Remote-Abgleich."""
-    from .remote import get_ssh_settings
-
-    settings = get_ssh_settings(project)
-    pub_path = Path(settings["public_key"]).expanduser().resolve()
+def _public_key_prefix_from_path(pub_path: Path) -> str:
+    """Key-Typ und Base64-Payload einer Public-Key-Datei lesen."""
     if not pub_path.exists():
         return ""
     try:
         text = pub_path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
-    parts = text.split()
+    return _public_key_prefix_from_text(text)
+
+
+def _public_key_prefix_from_text(public_key: str) -> str:
+    """Key-Typ und Base64-Payload einer OpenSSH-Public-Key-Zeile lesen."""
+    parts = str(public_key or "").strip().split()
     if len(parts) < 2:
         return ""
     return f"{parts[0]} {parts[1]}"
+
+
+def _public_key_prefix_for_private_key(private_key_path: Path) -> str:
+    """Public-Key-Präfix aus Companion-Datei oder dem privaten Key bestimmen."""
+    resolved = private_key_path.expanduser().resolve()
+    companion_prefix = _public_key_prefix_from_path(Path(str(resolved) + ".pub"))
+    if companion_prefix:
+        return companion_prefix
+    if not resolved.is_file():
+        return ""
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        return ""
+    try:
+        result = subprocess.run(
+            [ssh_keygen, "-y", "-P", "", "-f", str(resolved)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return _public_key_prefix_from_text(result.stdout)
+
+
+def _ssh_private_key_path_for_host(
+    project: Path,
+    windows: dict[str, Any],
+    host_data: dict[str, Any],
+    *,
+    requested_key: Path | str | None = None,
+) -> Path:
+    """Expliziten, aktiven oder gemerkten SSH-Key eines Hosts auflösen."""
+    from .remote import _connection_label, _effective_host_var, get_ssh_settings
+
+    raw_key = str(requested_key or "").strip()
+    if not raw_key and _connection_label(windows, host_data) == "SSH":
+        raw_key = str(
+            _effective_host_var(
+                windows,
+                host_data,
+                "ansible_ssh_private_key_file",
+                "",
+            )
+            or ""
+        ).strip()
+    if not raw_key:
+        raw_key = str(host_data.get("mavi_ssh_private_key_file", "") or "").strip()
+    if not raw_key:
+        raw_key = str(get_ssh_settings(project)["private_key"])
+    return Path(raw_key).expanduser().resolve()
+
+
+def _mavi_public_key_prefix(project: Path) -> str:
+    """Nur Key-Typ + Base64-Payload, ohne Kommentar, für exakten Remote-Abgleich."""
+    from .remote import get_ssh_settings
+
+    settings = get_ssh_settings(project)
+    pub_path = Path(settings["public_key"]).expanduser().resolve()
+    return _public_key_prefix_from_path(pub_path)
 
 
 def _remove_mavi_ssh_keys_from_host(
@@ -3782,27 +4543,970 @@ def _parse_ansible_core_version() -> tuple[int, ...] | None:
     return tuple(int(x or 0) for x in m.groups())
 
 
+def _remote_management_disabled_state(host_data: dict[str, Any]) -> dict[str, Any] | None:
+    """Versionierte Option-11-Nachweise lesen, ohne alte Einträge schönzureden."""
+    from .remote import _normalized_certificate_thumbprint
+
+    raw = host_data.get("mavi_remote_management_disabled")
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("winrm") is not True or raw.get("openssh") is not True:
+        return None
+    try:
+        version = int(raw.get("version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    verified = (
+        version >= 3
+        and raw.get("remote_cleanup_verified") is True
+        and raw.get("winrm_scope_verified") is True
+        and raw.get("winrm_listeners_cleared") is True
+        and raw.get("bootstrap_scope_verified") is True
+        and raw.get("openssh_stopped_verified") is True
+    )
+    bootstrap_thumbprints = _bootstrap_state_thumbprints(
+        {
+            "root_thumbprint": raw.get("bootstrap_ca_thumbprint"),
+            "root_thumbprints": raw.get("bootstrap_ca_thumbprints"),
+        }
+    )
+    return {
+        "version": version,
+        "verified": verified,
+        "controller_cleanup_complete": raw.get("controller_cleanup_complete") is True,
+        "recorded_at": str(raw.get("recorded_at", "") or ""),
+        "bootstrap_ca_thumbprint": bootstrap_thumbprints[0] if bootstrap_thumbprints else "",
+        "bootstrap_ca_thumbprints": bootstrap_thumbprints,
+        "winrm_root_thumbprint": _normalized_certificate_thumbprint(
+            raw.get("winrm_root_thumbprint")
+        ),
+        "raw": raw,
+    }
+
+
+def _stored_bootstrap_root_thumbprints(host_data: dict[str, Any]) -> tuple[str, ...]:
+    """Nur hostgebundene oder verifizierte Rückbau-Identitäten liefern."""
+    thumbprints = _verified_bootstrap_root_thumbprints(host_data)
+    if thumbprints:
+        return thumbprints
+    disabled = _remote_management_disabled_state(host_data)
+    if disabled and disabled.get("verified"):
+        return tuple(disabled["bootstrap_ca_thumbprints"])
+    return ()
+
+
+def _host_known_ca_thumbprints(
+    project: Path,
+    host_data: dict[str, Any],
+) -> tuple[str, tuple[str, ...]]:
+    """Nur lokal bekannte exakte Mavi-CA-Thumbprints für einen Live-Audit liefern."""
+    from .remote import (
+        _certificate_thumbprint_from_file,
+        _normalized_certificate_thumbprint,
+        _winrm_pki_paths,
+    )
+
+    winrm_thumbprint = ""
+    winrm_state = host_data.get("mavi_winrm_https")
+    if isinstance(winrm_state, dict):
+        winrm_thumbprint = _normalized_certificate_thumbprint(winrm_state.get("root_thumbprint"))
+    disabled = _remote_management_disabled_state(host_data)
+    if not winrm_thumbprint and disabled:
+        winrm_thumbprint = disabled["winrm_root_thumbprint"]
+    if not winrm_thumbprint:
+        try:
+            ca_der = _winrm_pki_paths(project)["ca_der"]
+            if ca_der.is_file():
+                winrm_thumbprint = _certificate_thumbprint_from_file(ca_der)
+        except (OSError, ValueError):
+            pass
+
+    # Ohne pro Host gespeicherte Identität darf eine aktuell auf dem Controller
+    # liegende, möglicherweise rotierte Bootstrap-CA den Audit-Scope nicht
+    # erfinden. Ein leerer Wert macht die Live-Prüfung bewusst unvollständig.
+    bootstrap_thumbprints = _stored_bootstrap_root_thumbprints(host_data)
+    return winrm_thumbprint, bootstrap_thumbprints
+
+
+def _winrm_root_certificate_der_base64_for_thumbprint(
+    project: Path,
+    expected_thumbprint: str,
+) -> str:
+    """Nur die exakt erwartete öffentliche Mavi-WinRM-CA für einen Audit liefern."""
+    from .remote import (
+        _certificate_der_base64_from_file,
+        _certificate_thumbprint_from_file,
+        _normalized_certificate_thumbprint,
+        _winrm_pki_paths,
+    )
+
+    expected = _normalized_certificate_thumbprint(expected_thumbprint)
+    if not expected:
+        return ""
+    ca_der = _winrm_pki_paths(project)["ca_der"]
+    if not ca_der.is_file():
+        return ""
+    try:
+        if _certificate_thumbprint_from_file(ca_der) != expected:
+            return ""
+        return _certificate_der_base64_from_file(ca_der)
+    except (OSError, ValueError):
+        return ""
+
+
+def _certificate_expiry_text(value: Any, *, warning_days: int) -> tuple[str, bool]:
+    """Ablaufdatum samt Warnzustand ohne Annahmen über lokale Zeitzonen formatieren."""
+    from .remote import _normalized_certificate_timestamp
+
+    try:
+        normalized = _normalized_certificate_timestamp(value, label="Zertifikatsablaufdatum")
+        expires = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except RuntimeError:
+        return "unbekannt", True
+    remaining_seconds = (expires - datetime.now(timezone.utc)).total_seconds()
+    remaining_days = int(remaining_seconds // 86400)
+    if remaining_seconds <= 0:
+        return f"{normalized} (abgelaufen)", True
+    warning = remaining_seconds <= warning_days * 86400
+    return f"{normalized} (noch {remaining_days} Tage)", warning
+
+
+def _print_certificate_metadata(host_data: dict[str, Any]) -> None:
+    """Im Inventory gespeicherte Laufzeiten mit den geplanten Warnschwellen zeigen."""
+    from .remote import _normalized_certificate_thumbprint
+
+    state = host_data.get("mavi_winrm_https")
+    if not isinstance(state, dict):
+        return
+    leaf_thumbprint = _normalized_certificate_thumbprint(state.get("certificate_thumbprint"))
+    root_thumbprint = _normalized_certificate_thumbprint(state.get("root_thumbprint"))
+    if leaf_thumbprint:
+        leaf_text, leaf_warning = _certificate_expiry_text(
+            state.get("certificate_not_after"),
+            warning_days=30,
+        )
+        print(f"WinRM-Leaf:         {leaf_thumbprint} — {leaf_text}")
+        if leaf_warning:
+            print("! WinRM-Serverzertifikat läuft in weniger als 30 Tagen ab oder ist unbekannt.")
+    if root_thumbprint:
+        root_text, root_warning = _certificate_expiry_text(
+            state.get("root_not_after"),
+            warning_days=90,
+        )
+        print(f"WinRM-Root-CA:      {root_thumbprint} — {root_text}")
+        if root_warning:
+            print("! Mavi-WinRM-Root-CA läuft in weniger als 90 Tagen ab oder ist unbekannt.")
+
+
+
+def _audit_value(audit: dict[str, Any], section: str, field: str, default: Any = None) -> Any:
+    value = audit.get(section)
+    return value.get(field, default) if isinstance(value, dict) else default
+
+
+def _audit_nonnegative_count(audit: dict[str, Any], section: str, field: str) -> int:
+    value = _audit_value(audit, section, field, -1)
+    if isinstance(value, bool):
+        return -1
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return number if number >= 0 else -1
+
+
+def _audit_service_is_disabled_or_absent(audit: dict[str, Any], section: str) -> bool:
+    exists = _audit_value(audit, section, "Exists", None)
+    if exists is False:
+        return True
+    start = _audit_value(audit, section, "Start", -1)
+    status = str(_audit_value(audit, section, "Status", "") or "").casefold()
+    return start == 4 and status == "stopped"
+
+
+def _audit_service_state_is_unknown(audit: dict[str, Any], section: str) -> bool:
+    """Nur einen tatsächlich gelesenen Dienstzustand als aktiv/inaktiv werten."""
+    exists = _audit_value(audit, section, "Exists", None)
+    if exists is False:
+        return False
+    if exists is not True:
+        return True
+    start = _audit_value(audit, section, "Start", -1)
+    status = str(_audit_value(audit, section, "Status", "") or "").casefold()
+    return not isinstance(start, int) or start < 0 or status not in {
+        "stopped",
+        "running",
+        "startpending",
+        "stoppending",
+        "paused",
+        "pausepending",
+        "continuepending",
+    }
+
+
+def _classify_remote_management_audit(
+    audit: dict[str, Any] | None,
+    disabled_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Live-Audit in bestätigte, partielle und unbekannte Rückbauzustände einordnen."""
+    proof_available = bool(disabled_state and disabled_state.get("verified"))
+    legacy_record = disabled_state is not None and not proof_available
+    if audit is None:
+        return {
+            "code": "disabled_unreachable" if proof_available else "unknown_unreachable",
+            "label": (
+                "AUS – laut Rückbau-Nachweis; Live-Prüfung nicht möglich"
+                if proof_available
+                else "UNBEKANNT – Live-Prüfung nicht möglich"
+            ),
+            "details": [],
+        }
+
+    query_errors = audit.get("QueryErrors")
+    query_errors = query_errors if isinstance(query_errors, list) else ["Audit-Ergebnis unvollständig"]
+    winrm_listener_count = _audit_nonnegative_count(audit, "WinRM", "MaviListenerCount")
+    foreign_winrm_listener_count = _audit_nonnegative_count(
+        audit, "WinRM", "ForeignListenerCount"
+    )
+    winrm_rule_count = _audit_nonnegative_count(audit, "WinRM", "FirewallRuleCount")
+    winrm_policy_count = _audit_nonnegative_count(audit, "WinRM", "PolicyValueCount")
+    ssh_rule_count = _audit_nonnegative_count(audit, "OpenSSH", "FirewallRuleCount")
+    key_count = _audit_nonnegative_count(audit, "OpenSSH", "MaviKeyCount")
+    ssh_config_backup_count = _audit_nonnegative_count(
+        audit, "OpenSSH", "MaviConfigBackupCount"
+    )
+    leaf_count = _audit_nonnegative_count(audit, "Certificates", "ManagedLeafCount")
+    roots_present = any(
+        _audit_value(audit, "Certificates", key, False) is True
+        for key in ("WinRmRootPresent", "BootstrapRootPresent", "CurrentLeafPresent")
+    )
+    cert_checks_known = (
+        _audit_value(audit, "CertificateChecks", "WinRmRootThumbprintProvided", False) is True
+        and _audit_value(audit, "CertificateChecks", "WinRmRootIdentityProvided", False) is True
+        and _audit_value(audit, "CertificateChecks", "WinRmLeafIdentityProvided", False) is True
+        and _audit_value(audit, "CertificateChecks", "BootstrapRootThumbprintProvided", False) is True
+    )
+    listener_check_skipped_disabled = (
+        _audit_value(audit, "WinRM", "ListenerCheckSkippedDisabled", False) is True
+    )
+    listener_scope_known = not listener_check_skipped_disabled or proof_available
+
+    winrm_unknown = _audit_service_state_is_unknown(audit, "WinRM")
+    ssh_unknown = _audit_service_state_is_unknown(audit, "OpenSSH")
+    winrm_active = not winrm_unknown and not _audit_service_is_disabled_or_absent(audit, "WinRM")
+    ssh_active = not ssh_unknown and not _audit_service_is_disabled_or_absent(audit, "OpenSSH")
+    mavi_residual = (
+        winrm_listener_count > 0
+        or winrm_rule_count > 0
+        or ssh_rule_count > 0
+        or key_count > 0
+        or ssh_config_backup_count > 0
+        or leaf_count > 0
+        or roots_present
+    )
+    residual = mavi_residual or foreign_winrm_listener_count > 0
+    unknown_counts = any(
+        count < 0
+        for count in (
+            winrm_listener_count,
+            foreign_winrm_listener_count,
+            winrm_rule_count,
+            ssh_rule_count,
+            key_count,
+            ssh_config_backup_count,
+            leaf_count,
+        )
+    )
+    clean = (
+        not query_errors
+        and cert_checks_known
+        and listener_scope_known
+        and not unknown_counts
+        and not winrm_active
+        and not ssh_active
+        and not residual
+    )
+    policy_details = (
+        ["generische WinRM-Richtlinienwerte beobachtet (nicht angefasst)"]
+        if winrm_policy_count > 0
+        else []
+    )
+    if clean:
+        if legacy_record:
+            return {
+                "code": "legacy_not_confirmable",
+                "label": "UNBEKANNT – alter Rückbau-Eintrag ohne Rückbau-Nachweis",
+                "details": ["Alter Inventory-Eintrag wird nicht als sauber bestätigt."],
+            }
+        return {
+            "code": "confirmed_disabled",
+            "label": "AUS – live bestätigt",
+            "details": policy_details,
+        }
+
+    details: list[str] = []
+    if winrm_active:
+        details.append("WinRM aktiv")
+    if ssh_active:
+        details.append("sshd aktiv")
+    if mavi_residual:
+        details.append("Mavi-Artefakte vorhanden")
+    if ssh_config_backup_count > 0:
+        details.append("Mavi-OpenSSH-Konfigurationssicherung vorhanden")
+    if foreign_winrm_listener_count > 0:
+        details.append("nicht zuordenbare WinRM-Listener erhalten")
+    details.extend(policy_details)
+    if (
+        query_errors
+        or unknown_counts
+        or winrm_unknown
+        or ssh_unknown
+        or not cert_checks_known
+        or not listener_scope_known
+    ):
+        details.append("Live-Prüfung unvollständig")
+
+    if winrm_active or ssh_active:
+        return {"code": "active", "label": "AKTIV", "details": details}
+    if residual:
+        return {"code": "partial", "label": "TEILWEISE", "details": details}
+    if proof_available:
+        return {
+            "code": "disabled_unreachable",
+            "label": "AUS – laut Rückbau-Nachweis; Live-Prüfung unvollständig",
+            "details": details,
+        }
+    return {"code": "unknown", "label": "UNBEKANNT", "details": details}
+
+
+def _inventory_remote_management_status(
+    windows: dict[str, Any],
+    host_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Ohne Live-Check nur belegbare Aussagen aus dem Inventory treffen."""
+    from .remote import _connection_label
+
+    disabled = _remote_management_disabled_state(host_data)
+    if disabled and disabled["verified"]:
+        suffix = "" if disabled["controller_cleanup_complete"] else "; Controller-Bereinigung mit Hinweis"
+        return {
+            "code": "disabled_recorded",
+            "label": f"AUS – laut Rückbau-Nachweis (nicht live geprüft{suffix})",
+            "details": [],
+        }
+    if disabled:
+        return {
+            "code": "legacy_disabled",
+            "label": "UNBEKANNT – alter Rückbau-Eintrag ohne Rückbau-Nachweis",
+            "details": [],
+        }
+    connection = _connection_label(windows, host_data)
+    if connection in {"SSH", "PSRP", "WINRM"}:
+        return {
+            "code": "inventory_active",
+            "label": f"AKTIV/TEILWEISE – laut Inventory ({connection}; nicht live geprüft)",
+            "details": [],
+        }
+    return {"code": "unknown", "label": "UNBEKANNT – kein prüfbarer Verwaltungsstatus", "details": []}
+
+
+
+
+
+def _remote_management_audit_play(
+    *,
+    winrm_root_thumbprint: str,
+    winrm_root_certificate_der_base64: str,
+    bootstrap_root_thumbprints: tuple[str, ...] | list[str],
+    current_leaf_thumbprint: str,
+    current_key_prefix: str,
+    expected_fqdn: str = "",
+    current_key_marker: str = "",
+    openssh_firewall_rule: str = "",
+    openssh_config_backup: str = "",
+) -> list[dict[str, Any]]:
+    """Reinen Lese-Audit für Mavi-Remote-Artefakte auf einem Windows-PC erzeugen."""
+    powershell = r'''[CmdletBinding()]
+param(
+    [string]$WinRmRootThumbprint = '',
+    [string]$WinRmRootCertificateDerBase64 = '',
+    [string[]]$BootstrapRootThumbprints = @(),
+    [string]$CurrentLeafThumbprint = '',
+    [string]$CurrentKeyPrefix = '',
+    [string]$ExpectedFqdn = '',
+    [string]$CurrentKeyMarker = '',
+    [string]$OpenSshFirewallRuleName = '',
+    [string]$OpenSshConfigBackupPath = ''
+)
+
+$ErrorActionPreference = 'Stop'
+$WinRmRootThumbprint = ($WinRmRootThumbprint -replace '\s', '').ToUpperInvariant()
+$WinRmRootCertificateDerBase64 = $WinRmRootCertificateDerBase64.Trim()
+$BootstrapRootThumbprints = @(
+    $BootstrapRootThumbprints |
+    ForEach-Object { (([string]$_) -replace '\s', '').ToUpperInvariant() } |
+    Select-Object -Unique
+)
+$CurrentLeafThumbprint = ($CurrentLeafThumbprint -replace '\s', '').ToUpperInvariant()
+$ExpectedFqdn = $ExpectedFqdn.Trim().TrimEnd('.')
+$bootstrapThumbprintsValid = (
+    @($BootstrapRootThumbprints).Count -gt 0 -and
+    @($BootstrapRootThumbprints | Where-Object { $_ -notmatch '^[A-F0-9]{40}$' }).Count -eq 0
+)
+
+$result = [ordered]@{
+    Version = 1
+    QueryErrors = @()
+    CertificateChecks = [ordered]@{
+        WinRmRootThumbprintProvided = ($WinRmRootThumbprint -match '^[A-F0-9]{40}$')
+        WinRmRootIdentityProvided = $false
+        WinRmLeafIdentityProvided = (-not [string]::IsNullOrWhiteSpace($ExpectedFqdn))
+        BootstrapRootThumbprintProvided = $bootstrapThumbprintsValid
+    }
+    WinRM = [ordered]@{
+        Exists = $false
+        Status = ''
+        Start = -1
+        ListenerCheckSkippedDisabled = $false
+        TotalListenerCount = -1
+        MaviListenerCount = -1
+        ForeignListenerCount = -1
+        FirewallRuleCount = -1
+        PolicyValueCount = -1
+    }
+    OpenSSH = [ordered]@{
+        Exists = $false
+        Status = ''
+        Start = -1
+        FirewallRuleCount = -1
+        MaviKeyCount = -1
+        MaviConfigBackupCount = -1
+    }
+    Certificates = [ordered]@{
+        WinRmRootPresent = $false
+        WinRmRootNotAfter = ''
+        BootstrapRootPresent = $false
+        BootstrapRoots = [ordered]@{}
+        CurrentLeafPresent = $false
+        CurrentLeafNotAfter = ''
+        ManagedLeafCount = -1
+        LatestManagedLeafNotAfter = ''
+    }
+}
+
+function Add-MaviAuditError {
+    param([string]$Area, [object]$ErrorRecord)
+    $message = ''
+    if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+        $message = [string]$ErrorRecord.Exception.Message
+    }
+    if ($message) {
+        $result.QueryErrors += ($Area + ': ' + $message)
+    }
+    else {
+        $result.QueryErrors += $Area
+    }
+}
+
+$expectedWinRmRoot = $null
+if (-not [string]::IsNullOrWhiteSpace($WinRmRootCertificateDerBase64)) {
+    try {
+        $expectedWinRmRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [Convert]::FromBase64String($WinRmRootCertificateDerBase64)
+        )
+        $expectedWinRmRootThumbprint = ([string]$expectedWinRmRoot.Thumbprint).ToUpperInvariant()
+        if (
+            $WinRmRootThumbprint -notmatch '^[A-F0-9]{40}$' -or
+            -not $expectedWinRmRootThumbprint.Equals(
+                $WinRmRootThumbprint,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            throw 'Root-Zertifikat und erwarteter Mavi-Root-Fingerabdruck stimmen nicht überein.'
+        }
+        $result.CertificateChecks.WinRmRootIdentityProvided = $true
+    }
+    catch { Add-MaviAuditError 'Mavi-WinRM-Root-Identität' $_ }
+}
+else {
+    Add-MaviAuditError 'Mavi-WinRM-Root-Identität' $null
+}
+
+function Test-MaviAuditLeafCertificate {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot,
+        [string]$ExpectedFqdn
+    )
+    if (
+        $null -eq $Certificate -or
+        $null -eq $ExpectedRoot -or
+        [string]::IsNullOrWhiteSpace($ExpectedFqdn)
+    ) {
+        return $false
+    }
+    $expectedFriendlyName = "Mavi WinRM HTTPS $ExpectedFqdn"
+    if (-not ([string]$Certificate.FriendlyName).Equals($expectedFriendlyName, [System.StringComparison]::Ordinal)) {
+        return $false
+    }
+    $subjectName = [string]$Certificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+        $false
+    )
+    if (-not $subjectName.Equals($ExpectedFqdn, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.VerificationFlags = (
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority -bor
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+        )
+        [void]$chain.ChainPolicy.ExtraStore.Add($ExpectedRoot)
+        if (-not $chain.Build($Certificate) -or $chain.ChainElements.Count -lt 2) {
+            return $false
+        }
+        $chainRoot = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+        return ([string]$chainRoot.Thumbprint).Equals(
+            [string]$ExpectedRoot.Thumbprint,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
+try {
+    $service = Get-Service -Name WinRM -ErrorAction SilentlyContinue
+    if ($null -ne $service) {
+        $result.WinRM.Exists = $true
+        $result.WinRM.Status = [string]$service.Status
+    }
+    $registryPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM'
+    if (Test-Path -LiteralPath $registryPath) {
+        $result.WinRM.Start = [int](Get-ItemPropertyValue -LiteralPath $registryPath -Name Start -ErrorAction Stop)
+    }
+}
+catch { Add-MaviAuditError 'WinRM-Dienst' $_ }
+
+if (
+    $result.WinRM.Exists -eq $true -and
+    [string]$result.WinRM.Status -eq 'Stopped' -and
+    [int]$result.WinRM.Start -eq 4
+) {
+    # Der WSMan:-Provider kann bei Stopped + Disabled lokal bis zum
+    # Ansible-Timeout blockieren. Nach einem verifizierten v3-Rückbau ist der
+    # Listener-Endzustand bereits Teil des signierten Ablaufbelegs; Python
+    # akzeptiert dieses Überspringen nur zusammen mit genau diesem Nachweis.
+    $result.WinRM.ListenerCheckSkippedDisabled = $true
+    $result.WinRM.TotalListenerCount = 0
+    $result.WinRM.MaviListenerCount = 0
+    $result.WinRM.ForeignListenerCount = 0
+}
+else {
+    try {
+        $listeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
+        $result.WinRM.TotalListenerCount = $listeners.Count
+        if ($null -eq $expectedWinRmRoot) {
+            throw 'Die exakte Mavi-WinRM-Root-Identität fehlt.'
+        }
+        $maviListenerCount = 0
+        foreach ($listener in $listeners) {
+            if ($listener.Keys -notcontains 'Transport=HTTPS') {
+                continue
+            }
+            $listenerValues = @{}
+            foreach ($listenerValue in @(Get-ChildItem -LiteralPath $listener.PSPath -ErrorAction Stop)) {
+                $listenerValueName = [string]$listenerValue.Name
+                if (-not [string]::IsNullOrWhiteSpace($listenerValueName)) {
+                    $listenerValues[$listenerValueName] = [string]$listenerValue.Value
+                }
+            }
+            $listenerThumbprint = (([string]$listenerValues['CertificateThumbprint']).Trim() -replace '\s', '').ToUpperInvariant()
+            if ($listenerThumbprint -notmatch '^[A-F0-9]{40}$') {
+                continue
+            }
+            $listenerCertificate = Get-Item -LiteralPath ("Cert:\LocalMachine\My\$listenerThumbprint") -ErrorAction SilentlyContinue
+            if (Test-MaviAuditLeafCertificate -Certificate $listenerCertificate -ExpectedRoot $expectedWinRmRoot -ExpectedFqdn $ExpectedFqdn) {
+                $maviListenerCount++
+            }
+        }
+        $result.WinRM.MaviListenerCount = $maviListenerCount
+        $result.WinRM.ForeignListenerCount = $listeners.Count - $maviListenerCount
+    }
+    catch { Add-MaviAuditError 'WinRM-Listener' $_ }
+}
+
+try {
+    $winrmRuleNames = @(
+        'Mavi-WinRM-HTTPS-Ansible-In-TCP',
+        'Mavi-WinRM-HTTP-Dauerhaft-Block-TCP',
+        'Mavi-WinRM-HTTPS-Setup-Isolation-TCP'
+    )
+    $ruleCount = 0
+    foreach ($ruleName in $winrmRuleNames) {
+        $ruleCount += @(
+            Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+            Where-Object { [string]$_.Group -eq 'Mavi Provisioner' }
+        ).Count
+    }
+    $result.WinRM.FirewallRuleCount = $ruleCount
+}
+catch { Add-MaviAuditError 'WinRM-Firewall' $_ }
+
+try {
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+    $policyCount = 0
+    if (Test-Path -LiteralPath $policyPath) {
+        $policy = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+        foreach ($policyName in @(
+            'AllowUnencryptedTraffic',
+            'AllowKerberos',
+            'AllowNegotiate',
+            'AllowBasic',
+            'AllowCredSSP'
+        )) {
+            if ($null -ne $policy.PSObject.Properties[$policyName]) {
+                $policyCount++
+            }
+        }
+    }
+    $result.WinRM.PolicyValueCount = $policyCount
+}
+catch { Add-MaviAuditError 'WinRM-Richtlinie' $_ }
+
+try {
+    $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($null -ne $service) {
+        $result.OpenSSH.Exists = $true
+        $result.OpenSSH.Status = [string]$service.Status
+    }
+    $registryPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd'
+    if (Test-Path -LiteralPath $registryPath) {
+        $result.OpenSSH.Start = [int](Get-ItemPropertyValue -LiteralPath $registryPath -Name Start -ErrorAction Stop)
+    }
+}
+catch { Add-MaviAuditError 'OpenSSH-Dienst' $_ }
+
+try {
+    if ($OpenSshFirewallRuleName -notmatch '^Mavi-OpenSSH-[a-z0-9-]+-Ansible-In-TCP$') {
+        throw 'Der exakte instanzgebundene Mavi-OpenSSH-Firewallregelname fehlt.'
+    }
+    $result.OpenSSH.FirewallRuleCount = @(
+        Get-NetFirewallRule -Name $OpenSshFirewallRuleName -ErrorAction SilentlyContinue
+    ).Count
+}
+catch { Add-MaviAuditError 'OpenSSH-Firewall' $_ }
+
+try {
+    $keyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    $keyCount = 0
+    if (Test-Path -LiteralPath $keyFile -PathType Leaf) {
+        foreach ($lineObject in @(Get-Content -LiteralPath $keyFile -ErrorAction Stop)) {
+            $line = ([string]$lineObject).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($CurrentKeyMarker)) {
+                $markerPattern = '(^|\s)' + [regex]::Escape($CurrentKeyMarker) + '(\s|$)'
+                if ($line -match $markerPattern) {
+                    $keyCount++
+                    continue
+                }
+            }
+            if (
+                -not [string]::IsNullOrWhiteSpace($CurrentKeyPrefix) -and
+                ($line -eq $CurrentKeyPrefix -or $line.StartsWith($CurrentKeyPrefix + ' '))
+            ) {
+                $keyCount++
+            }
+        }
+    }
+    $result.OpenSSH.MaviKeyCount = $keyCount
+}
+catch { Add-MaviAuditError 'OpenSSH-Keydatei' $_ }
+
+try {
+    if (
+        $OpenSshConfigBackupPath -notmatch
+        '^MaviProvisioner\\bootstrap\\[a-z0-9-]+\\sshd_config\.pre-mavi\.bak$'
+    ) {
+        throw 'Der exakte instanzgebundene Mavi-OpenSSH-Konfigurationssicherungspfad fehlt.'
+    }
+    $configBackup = Join-Path $env:ProgramData $OpenSshConfigBackupPath
+    if (Test-Path -LiteralPath $configBackup -PathType Leaf) {
+        $result.OpenSSH.MaviConfigBackupCount = 1
+    }
+    else {
+        $result.OpenSSH.MaviConfigBackupCount = 0
+    }
+}
+catch { Add-MaviAuditError 'OpenSSH-Mavi-Konfigurationssicherung' $_ }
+
+try {
+    $winRmRoot = $null
+    if ($WinRmRootThumbprint -match '^[A-F0-9]{40}$') {
+        $winRmRoot = Get-Item -LiteralPath ("Cert:\LocalMachine\Root\$WinRmRootThumbprint") -ErrorAction SilentlyContinue
+        if ($null -ne $winRmRoot) {
+            $result.Certificates.WinRmRootPresent = $true
+            $result.Certificates.WinRmRootNotAfter = $winRmRoot.NotAfter.ToUniversalTime().ToString('o')
+        }
+    }
+    foreach ($bootstrapRootThumbprint in $BootstrapRootThumbprints) {
+        if ($bootstrapRootThumbprint -notmatch '^[A-F0-9]{40}$') { continue }
+        $bootstrapRootResult = [ordered]@{
+            Present = $false
+            NotAfter = ''
+        }
+        $bootstrapRoot = Get-Item -LiteralPath ("Cert:\LocalMachine\Root\$bootstrapRootThumbprint") -ErrorAction SilentlyContinue
+        if ($null -ne $bootstrapRoot) {
+            $result.Certificates.BootstrapRootPresent = $true
+            $bootstrapRootResult.Present = $true
+            $bootstrapRootResult.NotAfter = $bootstrapRoot.NotAfter.ToUniversalTime().ToString('o')
+        }
+        $result.Certificates.BootstrapRoots[$bootstrapRootThumbprint] = $bootstrapRootResult
+    }
+    if ($CurrentLeafThumbprint -match '^[A-F0-9]{40}$') {
+        $currentLeaf = Get-Item -LiteralPath ("Cert:\LocalMachine\My\$CurrentLeafThumbprint") -ErrorAction SilentlyContinue
+        if ($null -ne $currentLeaf) {
+            $result.Certificates.CurrentLeafPresent = $true
+            $result.Certificates.CurrentLeafNotAfter = $currentLeaf.NotAfter.ToUniversalTime().ToString('o')
+        }
+    }
+
+    $managedLeafCount = 0
+    $latestManagedLeaf = $null
+    foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
+        if (-not (Test-Path -LiteralPath $storePath)) { continue }
+        foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction Stop)) {
+            # Auch im Audit zählt ein Zertifikat nur mit Mavi-Namen und einer
+            # verifizierten Kette bis zur exakt bekannten Mavi-Root-CA.
+            if (Test-MaviAuditLeafCertificate -Certificate $certificate -ExpectedRoot $expectedWinRmRoot -ExpectedFqdn $ExpectedFqdn) {
+                $managedLeafCount++
+                if ($null -eq $latestManagedLeaf -or $certificate.NotAfter -gt $latestManagedLeaf.NotAfter) {
+                    $latestManagedLeaf = $certificate
+                }
+            }
+        }
+    }
+    $result.Certificates.ManagedLeafCount = $managedLeafCount
+    if ($null -ne $latestManagedLeaf) {
+        $result.Certificates.LatestManagedLeafNotAfter = $latestManagedLeaf.NotAfter.ToUniversalTime().ToString('o')
+    }
+}
+catch { Add-MaviAuditError 'Mavi-Zertifikate' $_ }
+
+$marker = [Convert]::ToBase64String(
+    [System.Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Depth 6 -Compress))
+)
+$Ansible.Result = @{ Marker = $marker }
+$Ansible.Changed = $false
+'''
+    return [{
+        "name": "Mavi Remote-Verwaltung schreibgeschützt prüfen",
+        "hosts": "windows",
+        "gather_facts": False,
+        "tasks": [
+            {
+                "name": "Mavi Remote-Verwaltungsartefakte ausschließlich lesen",
+                "ansible.windows.win_powershell": {
+                    "error_action": "stop",
+                    "script": powershell,
+                    "parameters": {
+                        "WinRmRootThumbprint": winrm_root_thumbprint,
+                        "WinRmRootCertificateDerBase64": winrm_root_certificate_der_base64,
+                        "BootstrapRootThumbprints": list(bootstrap_root_thumbprints),
+                        "CurrentLeafThumbprint": current_leaf_thumbprint,
+                        "CurrentKeyPrefix": current_key_prefix,
+                        "ExpectedFqdn": expected_fqdn,
+                        "CurrentKeyMarker": current_key_marker,
+                        "OpenSshFirewallRuleName": openssh_firewall_rule,
+                        "OpenSshConfigBackupPath": openssh_config_backup,
+                    },
+                },
+                "register": "mavi_remote_management_audit",
+            },
+            {
+                "name": "Mavi Remote-Verwaltungs-Audit auslesen",
+                "ansible.builtin.debug": {
+                    "msg": "Mavi_REMOTE_AUDIT_B64={{ mavi_remote_management_audit.result.Marker }}",
+                },
+            },
+        ],
+    }]
+
+
+def _extract_remote_management_audit_result(play_output: str) -> dict[str, Any]:
+    """Den schreibgeschützten Windows-Auditmarker auf seine Grundstruktur prüfen."""
+    from .remote import _extract_json_marker
+
+    payload = _extract_json_marker(play_output, "Mavi_REMOTE_AUDIT_B64=")
+    for section in ("WinRM", "OpenSSH", "Certificates", "CertificateChecks"):
+        if not isinstance(payload.get(section), dict):
+            raise RuntimeError(f"Der Mavi-Remote-Audit enthält keinen gültigen Abschnitt {section}.")
+    query_errors = payload.get("QueryErrors")
+    if not isinstance(query_errors, list):
+        raise RuntimeError("Der Mavi-Remote-Audit enthält keine gültige Fehlerliste.")
+    return payload
+
+
+def _print_live_audit_certificate_metadata(
+    audit: dict[str, Any],
+    *,
+    winrm_root_thumbprint: str,
+    bootstrap_root_thumbprints: tuple[str, ...],
+    current_leaf_thumbprint: str,
+) -> None:
+    """Im Live-Audit gefundene, exakt adressierte Mavi-Zertifikate anzeigen."""
+    certificates = audit.get("Certificates")
+    if not isinstance(certificates, dict):
+        return
+    entries = (
+        (
+            "Live WinRM-Leaf",
+            current_leaf_thumbprint,
+            "CurrentLeafPresent",
+            "CurrentLeafNotAfter",
+            30,
+            "WinRM-Serverzertifikat",
+        ),
+        (
+            "Live WinRM-Root",
+            winrm_root_thumbprint,
+            "WinRmRootPresent",
+            "WinRmRootNotAfter",
+            90,
+            "Mavi-WinRM-Root-CA",
+        ),
+    )
+    for label, thumbprint, present_field, expiry_field, warning_days, kind in entries:
+        if certificates.get(present_field) is not True:
+            continue
+        expiry, warning = _certificate_expiry_text(
+            certificates.get(expiry_field),
+            warning_days=warning_days,
+        )
+        print(f"{label}:       {thumbprint or '(exakt geprüft)'} — {expiry}")
+        if warning:
+            print(f"! {kind} läuft bald ab, ist abgelaufen oder das Ablaufdatum ist unlesbar.")
+
+    raw_bootstrap_roots = certificates.get("BootstrapRoots")
+    bootstrap_roots = raw_bootstrap_roots if isinstance(raw_bootstrap_roots, dict) else {}
+    for thumbprint in bootstrap_root_thumbprints:
+        raw_root = bootstrap_roots.get(thumbprint)
+        root = raw_root if isinstance(raw_root, dict) else {}
+        if root.get("Present") is not True:
+            print(f"Live Bootstrap-CA: {thumbprint} — FEHLT")
+            continue
+        expiry, warning = _certificate_expiry_text(
+            root.get("NotAfter"),
+            warning_days=90,
+        )
+        print(f"Live Bootstrap-CA: {thumbprint} — {expiry}")
+        if warning:
+            print(
+                "! Mavi-Bootstrap-Root-CA läuft bald ab, ist abgelaufen "
+                "oder das Ablaufdatum ist unlesbar."
+            )
+
+    managed_leafs = _audit_nonnegative_count(audit, "Certificates", "ManagedLeafCount")
+    if managed_leafs > 0 and certificates.get("CurrentLeafPresent") is not True:
+        expiry, warning = _certificate_expiry_text(
+            certificates.get("LatestManagedLeafNotAfter"),
+            warning_days=30,
+        )
+        print(f"Live Mavi-Leaf:      {managed_leafs} gefunden — jüngstes: {expiry}")
+        if warning:
+            print("! Mavi-WinRM-Serverzertifikat läuft bald ab oder ist abgelaufen.")
+
+
+
+def _live_audit_transport_options(
+    project: Path,
+    windows: dict[str, Any],
+    host_data: dict[str, Any],
+    *,
+    requested_ssh_key: Path | None = None,
+) -> dict[str, Any]:
+    """Live-Audit auf den gespeicherten Kerberos-HTTPS-Transport festlegen."""
+    from .remote import (
+        _connection_label,
+        _psrp_https_inventory_vars,
+        _saved_winrm_https_transport,
+    )
+
+    connection = _connection_label(windows, host_data)
+    options: dict[str, Any] = {"inherit_vault_psrp_credentials": False}
+    if connection in {"PSRP", "WinRM"}:
+        settings, fqdn, ca_cert, kerberos_principal = _saved_winrm_https_transport(
+            project,
+            host_data,
+        )
+        options.update(
+            {
+                "inherit_vault_psrp_credentials": True,
+                "extra_vars": _psrp_https_inventory_vars(
+                    settings,
+                    fqdn=fqdn,
+                    ca_cert=ca_cert,
+                ),
+                "use_vault_kerberos_ticket": True,
+                "kerberos_principal": kerberos_principal,
+                "kerberos_target_fqdn": fqdn,
+            }
+        )
+    elif connection == "SSH" and requested_ssh_key is not None:
+        options["extra_vars"] = {
+            "ansible_ssh_private_key_file": str(requested_ssh_key.expanduser().resolve()),
+        }
+    return options
+
+
 def cmd_ssh_status(args: argparse.Namespace) -> None:
-    from .environment import ensure_initialized
+    """Lokalen Status und optional einen strikt lesenden Mavi-Remote-Audit zeigen."""
+
+    from .environment import die, ensure_initialized
+    from .execution import (
+        create_temporary_vault_password_file,
+        ensure_windows_tree,
+        load_inventory,
+    )
     from .remote import (
         _connection_label,
         _effective_host_var,
-        _host_inventory_entry,
-        _saved_winrm_https_transport,
+        _normalized_certificate_thumbprint,
+        _run_winrm_temporary_play,
+        _ssh_environment_marker,
         _winrm_https_settings,
         get_ssh_settings,
     )
     from .reports import redact_sensitive_text
-
     ensure_initialized(args.project, quiet=True)
+    host = getattr(args, "host", None)
+    all_hosts = bool(getattr(args, "all_hosts", False))
+    live = bool(getattr(args, "live", False))
+    if host and all_hosts:
+        die("Bitte entweder einen PC-Namen oder --all verwenden, nicht beides.")
+    if live and not host and not all_hosts:
+        die("--live benötigt einen PC-Namen oder --all.")
+
     settings = get_ssh_settings(args.project)
-    key_path = Path(getattr(args, "key", None) or settings["private_key"]).expanduser().resolve()
+    requested_key_raw = str(getattr(args, "key", None) or "").strip()
+    requested_key_path = (
+        Path(requested_key_raw).expanduser().resolve()
+        if requested_key_raw
+        else None
+    )
+    key_path = requested_key_path or Path(settings["private_key"]).expanduser().resolve()
     pub_path = Path(str(key_path) + ".pub")
     public_key, fingerprint = _public_key_summary(pub_path)
     version = _parse_ansible_core_version()
+    known_hosts = Path(settings["known_hosts"]).expanduser().resolve()
 
-    print("\nMavi OPENSSH-STATUS")
-    print("==================")
+    print("\nMavi REMOTE-VERWALTUNGSSTATUS")
+    print("============================")
     print(f"ssh executable:     {'✓ ' + shutil.which('ssh') if shutil.which('ssh') else 'FEHLT'}")
     print(f"ssh-keygen:         {'✓ ' + shutil.which('ssh-keygen') if shutil.which('ssh-keygen') else 'FEHLT'}")
     if version:
@@ -3811,68 +5515,224 @@ def cmd_ssh_status(args: argparse.Namespace) -> None:
     else:
         print("Ansible Core:       nicht erkannt")
     print(f"Private Key:        {'✓' if key_path.exists() else 'FEHLT'} {key_path}")
-    known_hosts = Path(settings["known_hosts"]).expanduser().resolve()
     print(f"Public Key:         {'✓' if public_key else 'FEHLT'} {pub_path}")
     print(f"known_hosts:        {'✓' if known_hosts.exists() else 'FEHLT'} {known_hosts}")
     if fingerprint:
         print(f"Fingerprint:        {fingerprint}")
     try:
         bootstrap = _bootstrap_settings(args.project)
-        print(f"HTTPS-Basis-URL:     ✓ {bootstrap['base_url']}")
-        print(f"HTTPS-Webroot:       {bootstrap['local_dir']}")
-        print(f"Ansible-Server-IP:   ✓ {bootstrap['ansible_server_ip']}")
-        print(f"MSI-Signer-Vorgabe:  {bootstrap['expected_signer'] or '(nur Authenticode Valid)'}")
+        print(f"HTTPS-Basis-URL:    ✓ {bootstrap['base_url']}")
+        print(f"HTTPS-Webroot:      {bootstrap['local_dir']}")
+        print(f"Ansible-Server-IP:  ✓ {bootstrap['ansible_server_ip']}")
     except ValueError as exc:
-        print(f"HTTPS-Bootstrap:     FEHLER — {redact_sensitive_text(exc)}")
+        print(f"HTTPS-Bootstrap:    FEHLER — {redact_sensitive_text(exc)}")
     try:
         winrm = _winrm_https_settings(args.project)
-        print(f"WinRM-Endziel:       ✓ HTTPS:{winrm['port']} / Kerberos-only")
+        print(f"WinRM-Endziel:      ✓ HTTPS:{winrm['port']} / Kerberos-only")
     except ValueError as exc:
-        print(f"WinRM-Endziel:       FEHLER — {redact_sensitive_text(exc)}")
+        print(f"WinRM-Endziel:      FEHLER — {redact_sensitive_text(exc)}")
 
-    host = getattr(args, "host", None)
+    if not host and not all_hosts:
+        print("\nTipp: ssh status <HOST>, ssh status --all oder jeweils mit --live verwenden.")
+        return
+
+    inv = load_inventory(args.project)
+    windows = ensure_windows_tree(inv)
+    raw_hosts = windows.get("hosts", {})
+    hosts = raw_hosts if isinstance(raw_hosts, dict) else {}
     if host:
-        inv, windows, host_data = _host_inventory_entry(args.project, host)
-        del inv
-        print("\nHOST")
-        print("----")
-        print(f"Name:               {host}")
-        print(f"IP:                 {host_data.get('ansible_host', '')}")
-        disabled_state = host_data.get("mavi_remote_management_disabled")
-        remote_management_disabled = (
-            isinstance(disabled_state, dict) and disabled_state.get("openssh") is True
+        if host not in hosts:
+            die(f"PC '{host}' ist nicht im Inventory vorhanden.")
+        selected_hosts = [host]
+    else:
+        selected_hosts = sorted(str(name) for name in hosts)
+    if not selected_hosts:
+        print("\nKeine Windows-PCs im Inventory.")
+        return
+
+    selected: list[tuple[str, dict[str, Any]]] = []
+    for name in selected_hosts:
+        raw_host_data = hosts.get(name)
+        selected.append((name, raw_host_data if isinstance(raw_host_data, dict) else {}))
+
+    live_results: dict[str, tuple[dict[str, Any] | None, str]] = {}
+    if live:
+        vault_file: Path | None = None
+        vault_password = getpass.getpass("Vault password (nicht Windows-/Domänenpasswort): ")
+        try:
+            vault_file = create_temporary_vault_password_file(vault_password)
+        except OSError as exc:
+            die(f"Temporäre Vault-Datei konnte nicht sicher angelegt werden: {exc}")
+        finally:
+            vault_password = ""
+
+        def run_live_audit(
+            name: str,
+            host_data: dict[str, Any],
+        ) -> tuple[dict[str, Any] | None, str]:
+            try:
+                winrm_root_thumbprint, bootstrap_root_thumbprints = _host_known_ca_thumbprints(
+                    args.project,
+                    host_data,
+                )
+                winrm_root_der_base64 = _winrm_root_certificate_der_base64_for_thumbprint(
+                    args.project,
+                    winrm_root_thumbprint,
+                )
+                winrm_state = host_data.get("mavi_winrm_https")
+                current_leaf_thumbprint = (
+                    _normalized_certificate_thumbprint(winrm_state.get("certificate_thumbprint"))
+                    if isinstance(winrm_state, dict)
+                    else ""
+                )
+                expected_winrm_fqdn = _winrm_leaf_fqdn_for_host(
+                    args.project,
+                    name,
+                    host_data,
+                )
+                live_key_path = _ssh_private_key_path_for_host(
+                    args.project,
+                    windows,
+                    host_data,
+                    requested_key=requested_key_path,
+                )
+                transport_options = _live_audit_transport_options(
+                    args.project,
+                    windows,
+                    host_data,
+                    requested_ssh_key=requested_key_path,
+                )
+                openssh_artifact_instance_id = _openssh_artifact_instance_id(
+                    args.project,
+                    host_data,
+                )
+                output = _run_winrm_temporary_play(
+                    args.project,
+                    host=name,
+                    play=_remote_management_audit_play(
+                        winrm_root_thumbprint=winrm_root_thumbprint,
+                        winrm_root_certificate_der_base64=winrm_root_der_base64,
+                        bootstrap_root_thumbprints=bootstrap_root_thumbprints,
+                        current_leaf_thumbprint=current_leaf_thumbprint,
+                        current_key_prefix=_public_key_prefix_for_private_key(
+                            live_key_path
+                        ),
+                        expected_fqdn=expected_winrm_fqdn,
+                        current_key_marker=_ssh_environment_marker(args.project),
+                        openssh_firewall_rule=_openssh_firewall_rule_name(
+                            args.project,
+                            instance_id=openssh_artifact_instance_id,
+                        ),
+                        openssh_config_backup=_openssh_config_backup_relative_path(
+                            args.project,
+                            instance_id=openssh_artifact_instance_id,
+                        ),
+                    ),
+                    vault_password_file=vault_file,
+                    description=f"Mavi Live-Audit für {name}",
+                    timeout=25.0,
+                    **transport_options,
+                )
+                return _extract_remote_management_audit_result(output), ""
+            except (OSError, RuntimeError, ValueError) as exc:
+                return None, redact_sensitive_text(exc)
+
+        try:
+            worker_count = min(8, len(selected))
+            print(
+                f"\nLive-Audit: {len(selected)} Host(s), "
+                f"maximal {worker_count} gleichzeitig.",
+                flush=True,
+            )
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="mavi-live-audit",
+            ) as executor:
+                future_hosts = {
+                    executor.submit(run_live_audit, name, host_data): name
+                    for name, host_data in selected
+                }
+                for future in as_completed(future_hosts):
+                    name = future_hosts[future]
+                    result = future.result()
+                    live_results[name] = result
+                    _, live_error = result
+                    progress = "nicht erreichbar/auswertbar" if live_error else "abgeschlossen"
+                    symbol = "!" if live_error else "✓"
+                    print(f"  {symbol} {name}: {progress}", flush=True)
+        finally:
+            if vault_file is not None:
+                vault_file.unlink(missing_ok=True)
+
+    classifications: list[dict[str, Any]] = []
+    print("\nHOSTS")
+    print("-----")
+    for name, host_data in selected:
+        disabled_state = _remote_management_disabled_state(host_data)
+        audit, live_error = live_results.get(name, (None, ""))
+        status = (
+            _classify_remote_management_audit(audit, disabled_state)
+            if live
+            else _inventory_remote_management_status(windows, host_data)
         )
-        if remote_management_disabled:
-            print("Remote-Verwaltung:  AUS — WinRM und OpenSSH wurden vollständig deaktiviert")
+        classifications.append(status)
+        target_host = str(host_data.get("ansible_host", "") or name)
+        ssh_port = _ssh_host_key_port(windows, host_data, settings["port"])
+
+        print(f"\n{name} ({target_host})")
+        print(f"Remote-Verwaltung:  {status['label']}")
         print(f"Inventory-Eintrag:  {_connection_label(windows, host_data)}")
-        print(f"Port:               {_effective_host_var(windows, host_data, 'ansible_port', '')}")
-        print(f"Shell:              {_effective_host_var(windows, host_data, 'ansible_shell_type', '(PSRP intern PowerShell)')}")
-        print(f"Ansible-User:       {_effective_host_var(windows, host_data, 'ansible_user', '(geerbt)')}")
-        print(f"Private-Key-Datei:  {host_data.get('ansible_ssh_private_key_file', '(nicht host-spezifisch)')}")
-        target_host = str(host_data.get("ansible_host", "") or host)
-        target_port = int(_effective_host_var(windows, host_data, "ansible_port", 22) or 22)
-        print(f"Host-Key bekannt:   {'✓' if _known_host_present(known_hosts, target_host, target_port) else 'NEIN'}")
-        if str(_effective_host_var(windows, host_data, "ansible_connection", "psrp")).lower() == "ssh":
-            if remote_management_disabled:
-                print("SSH-Dienst:         laut gespeichertem Stand-0-Status deaktiviert")
-            else:
-                key_only = not bool(_effective_host_var(windows, host_data, "ansible_ssh_password", ""))
-                print(f"SSH Key-only:       {'✓' if key_only else '! Passwort ist noch aktiv'}")
-        else:
-            protocol = str(_effective_host_var(windows, host_data, "ansible_psrp_protocol", "") or "").lower()
-            auth = str(_effective_host_var(windows, host_data, "ansible_psrp_auth", "") or "").lower()
-            if protocol != "https" or auth != "kerberos":
-                print("Transport-Schutz:  ! LEGACY/UNSICHER — nicht HTTPS + Kerberos-only")
-            else:
-                try:
-                    _saved_winrm_https_transport(args.project, host_data)
-                    print("Transport-Schutz:  ✓ HTTPS-Zertifikat + Kerberos-Endzustand gespeichert")
-                except ValueError as exc:
-                    print(f"Transport-Schutz:  ! {redact_sensitive_text(exc)}")
+        print(f"SSH-Port:           {ssh_port}")
+        print(f"Host-Key bekannt:   {'✓' if _known_host_present(known_hosts, target_host, ssh_port) else 'NEIN'}")
+        if disabled_state:
+            recorded = disabled_state.get("recorded_at") or "ohne Zeitstempel"
+            print(f"Rückbau-Nachweis:   Version {disabled_state['version']} / {recorded}")
+        for detail in status.get("details", []):
+            print(f"Hinweis:            {detail}")
+
+        _print_certificate_metadata(host_data)
+        if live:
+            if live_error:
+                print(f"Live-Check:         nicht möglich — {live_error}")
+            elif audit is not None:
+                print("Live-Check:         abgeschlossen (nur lesend)")
+                winrm_root_thumbprint, bootstrap_root_thumbprints = _host_known_ca_thumbprints(
+                    args.project,
+                    host_data,
+                )
+                winrm_state = host_data.get("mavi_winrm_https")
+                current_leaf_thumbprint = (
+                    _normalized_certificate_thumbprint(winrm_state.get("certificate_thumbprint"))
+                    if isinstance(winrm_state, dict)
+                    else ""
+                )
+                _print_live_audit_certificate_metadata(
+                    audit,
+                    winrm_root_thumbprint=winrm_root_thumbprint,
+                    bootstrap_root_thumbprints=bootstrap_root_thumbprints,
+                    current_leaf_thumbprint=current_leaf_thumbprint,
+                )
+
+    if all_hosts:
+        counts: dict[str, int] = {}
+        for status in classifications:
+            code = str(status.get("code", "unknown"))
+            counts[code] = counts.get(code, 0) + 1
+        inventory_active_count = counts.get("inventory_active", 0)
+        active_count = counts.get("active", 0)
+        partial_count = counts.get("partial", 0)
+        print(
+            "\nÜbersicht: "
+            f"{counts.get('confirmed_disabled', 0)} live aus, "
+            f"{counts.get('disabled_recorded', 0) + counts.get('disabled_unreachable', 0)} "
+            "laut Rückbau-Nachweis aus, "
+            f"{active_count + partial_count + inventory_active_count} aktiv/teilweise, "
+            f"{sum(value for code, value in counts.items() if code.startswith('unknown') or code.startswith('legacy'))} unbekannt."
+        )
 
 
 def ssh_menu(project: Path) -> None:
-    from .catalogs import choose_host_interactive
+    from .catalogs import choose_host_interactive, prompt_choice, yes_no
     from .execution import cmd_ping
 
     while True:
@@ -3883,13 +5743,13 @@ def ssh_menu(project: Path) -> None:
         print("  2) OpenSSH für neuen PC vollautomatisch vorbereiten")
         print("  3) PC auf OpenSSH umstellen")
         print("  4) PC auf geprüftes PSRP/WinRM HTTPS + Kerberos umstellen")
-        print("  5) OpenSSH-Status / Doctor")
+        print("  5) Remote-Verwaltungsstatus / Doctor")
         print("  6) Verbindung testen (win_ping)")
         print("  7) Mavi SSH-Key(s) von Windows-PC(s) entfernen")
         print("  8) nginx/HTTPS/Zertifikat automatisch einrichten oder prüfen")
         print("  9) WinRM über OpenSSH auf HTTPS + Kerberos-only härten")
         print(" 10) WinRM/Kerberos auf Stand 0 setzen (OpenSSH bleibt aktiv)")
-        print(" 11) WinRM und OpenSSH vollständig deaktivieren")
+        print(" 11) Mavi-Remote-Verwaltung vollständig deaktivieren")
         print("  0) Zurück")
         print()
         choice = input("> ").strip()
@@ -3907,8 +5767,28 @@ def ssh_menu(project: Path) -> None:
                 host = choose_host_interactive(project)
                 cmd_ssh_use_psrp(argparse.Namespace(project=project, host=host))
             elif choice == "5":
-                host = choose_host_interactive(project)
-                cmd_ssh_status(argparse.Namespace(project=project, host=host, key=None))
+                scope = prompt_choice(
+                    "Statusumfang:",
+                    [
+                        ("1", "Einzelnen PC prüfen"),
+                        ("2", "Alle Inventory-PCs prüfen"),
+                    ],
+                    "1",
+                )
+                host = choose_host_interactive(project) if scope == "1" else None
+                live = yes_no(
+                    "Live-Check über den aktuellen Verwaltungsweg ausführen?",
+                    default=False,
+                )
+                cmd_ssh_status(
+                    argparse.Namespace(
+                        project=project,
+                        host=host,
+                        key=None,
+                        all_hosts=(scope == "2"),
+                        live=live,
+                    )
+                )
             elif choice == "6":
                 host = choose_host_interactive(project)
                 try:
@@ -3983,6 +5863,8 @@ __all__ = (
     "_certificate_sha1_thumbprint",
     "_archive_bootstrap_pki_for_rotation",
     "_create_or_reuse_bootstrap_ca",
+    "_archive_bootstrap_root_ca",
+    "_controller_bound_bootstrap_root_certificates",
     "_issue_bootstrap_server_certificate",
     "_nginx_bootstrap_config",
     "_ufw_delete_tagged_rules",

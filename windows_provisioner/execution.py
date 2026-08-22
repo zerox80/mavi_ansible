@@ -118,6 +118,8 @@ def cmd_host_add(args: argparse.Namespace) -> None:
     from .remote import (
         _apply_ssh_transport,
         _connection_label,
+        _validate_inventory_host_alias,
+        _validate_new_host_alias,
     )
 
     ensure_initialized(args.project, quiet=True)
@@ -152,17 +154,36 @@ def cmd_host_add(args: argparse.Namespace) -> None:
         )
         requested_connection = "ssh"
 
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-        die("PC-Name enthält ungültige Zeichen.")
-
     inv = load_inventory(args.project)
     windows = ensure_windows_tree(inv)
     hosts = windows["hosts"]
+    name = str(name or "")
+    existing_host = name in hosts
+    try:
+        if existing_host:
+            name = _validate_inventory_host_alias(name)
+        else:
+            name = _validate_new_host_alias(name)
+    except ValueError as exc:
+        die(str(exc))
 
     host_data = hosts.setdefault(name, {})
     if not isinstance(host_data, dict):
         host_data = {}
         hosts[name] = host_data
+
+    disabled_state = host_data.get("mavi_remote_management_disabled")
+    if (
+        existing_host
+        and requested_connection == "ssh"
+        and isinstance(disabled_state, dict)
+        and disabled_state.get("openssh") is True
+    ):
+        die(
+            f"{name} ist als vollständig remote deaktiviert gespeichert. "
+            f"Nach dem lokalen OpenSSH-Starter ausschließlich mit "
+            f"'mavi-provisioner ssh use {name}' reaktivieren."
+        )
 
     host_data["ansible_host"] = ip
 
@@ -252,7 +273,12 @@ def shlex_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def run_subprocess(cmd: list[str], cwd: Path) -> int:
+def run_subprocess(
+    cmd: list[str],
+    cwd: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> int:
     from .environment import die
     from .reports import redact_sensitive_text
 
@@ -260,7 +286,7 @@ def run_subprocess(cmd: list[str], cwd: Path) -> int:
     print("\n→ " + redact_sensitive_text(shown_command))
     print()
     try:
-        return subprocess.call(cmd, cwd=str(cwd))
+        return subprocess.call(cmd, cwd=str(cwd), env=env)
     except FileNotFoundError:
         die(f"Befehl nicht gefunden: {cmd[0]}")
     return 1
@@ -1272,19 +1298,86 @@ def run_install_subprocess(
 
 
 def cmd_ping(args: argparse.Namespace) -> None:
-    from .environment import project_paths
+    from .clients import _create_prompted_client_vault_file
+    from .environment import die
+    from .remote import (
+        _close_client_ansible_session,
+        _open_client_ansible_session,
+        _temporary_single_host_inventory,
+    )
 
-    inventory = project_paths(args.project)["inventory"]
-    cmd = [
-        "ansible",
-        "-i",
-        str(inventory),
-        args.host,
-        "-m",
-        "ansible.windows.win_ping",
-        "--ask-vault-pass",
-    ]
-    raise SystemExit(run_subprocess(cmd, args.project))
+    vault_password_file = _create_prompted_client_vault_file()
+    ansible_session: dict[str, Any] | None = None
+    temporary_inventory_path: Path | None = None
+    return_code = 2
+    try:
+        try:
+            ansible_session = _open_client_ansible_session(
+                project=args.project,
+                host=str(args.host),
+                vault_password_file=vault_password_file,
+            )
+            (
+                ansible_executable,
+                ansible_python,
+                inventory_path,
+                runtime_environment,
+                transport_vars,
+            ) = _bound_ansible_session_context(
+                host=str(args.host),
+                ansible_session=ansible_session,
+            )
+            temporary_inventory_path = _temporary_single_host_inventory(
+                args.project,
+                str(args.host),
+            )
+            inventory_path = temporary_inventory_path
+            ansible_ad_hoc = ansible_executable.with_name("ansible")
+            if not ansible_ad_hoc.is_file():
+                raise RuntimeError(
+                    "Das ansible-Kommando fehlt in der erkannten Ansible-Umgebung."
+                )
+
+            command = [
+                str(ansible_python),
+                "-I",
+                str(ansible_ad_hoc),
+                "-i",
+                str(inventory_path),
+                str(args.host),
+                "-m",
+                "ansible.windows.win_ping",
+                "--vault-password-file",
+                str(vault_password_file),
+            ]
+            if transport_vars:
+                command.extend([
+                    "--extra-vars",
+                    json.dumps(
+                        transport_vars,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                ])
+
+            return_code = run_subprocess(
+                command,
+                args.project,
+                env=runtime_environment,
+            )
+        except RuntimeError as exc:
+            die(str(exc), code=2)
+    finally:
+        try:
+            if temporary_inventory_path is not None:
+                temporary_inventory_path.unlink(missing_ok=True)
+        finally:
+            try:
+                _close_client_ansible_session(ansible_session)
+            finally:
+                vault_password_file.unlink(missing_ok=True)
+
+    raise SystemExit(return_code)
 
 
 def selected_apps_need_user(
@@ -2119,7 +2212,7 @@ def cmd_install(args: argparse.Namespace) -> None:
     p = project_paths(args.project)
 
     # --limit darf hier niemals ein Ansible-Muster wie "all", "windows"
-    # oder "TP-*" erhalten. Nur ein exakt vorhandener Windows-Host ist gültig.
+    # oder "PC-*" erhalten. Nur ein exakt vorhandener Windows-Host ist gültig.
     _inventory, _windows, _host_data = _host_inventory_entry(
         args.project,
         str(args.host),

@@ -9,6 +9,7 @@ from ._dependencies import (
     Path,
     base64,
     binascii,
+    datetime,
     hashlib,
     ipaddress,
     json,
@@ -16,8 +17,10 @@ from ._dependencies import (
     re,
     secrets,
     shutil,
+    ssl,
     subprocess,
     tempfile,
+    timezone,
 )
 
 def get_ssh_settings(project: Path) -> dict[str, Any]:
@@ -67,6 +70,11 @@ def _host_inventory_entry(project: Path, host: str) -> tuple[dict[str, Any], dic
         load_inventory,
     )
 
+    try:
+        _validate_inventory_host_alias(host)
+    except ValueError as exc:
+        die(str(exc))
+
     inv = load_inventory(project)
     windows = ensure_windows_tree(inv)
     hosts = windows.get("hosts", {}) or {}
@@ -87,6 +95,8 @@ def _effective_host_var(windows: dict[str, Any], host_data: dict[str, Any], key:
 
 def _connection_label(windows: dict[str, Any], host_data: dict[str, Any]) -> str:
     connection = str(_effective_host_var(windows, host_data, "ansible_connection", "psrp") or "psrp").lower()
+    if connection == "mavi_disabled":
+        return "AUS"
     if connection == "ssh":
         return "SSH"
     if connection == "winrm":
@@ -122,6 +132,17 @@ def _clear_host_transport_vars(host_data: dict[str, Any]) -> None:
         host_data.pop(key, None)
 
 
+def _apply_remote_management_disabled_transport(host_data: dict[str, Any]) -> None:
+    """Den Host trotz geerbter Gruppenvariablen explizit fail-closed schalten."""
+    _clear_host_transport_vars(host_data)
+    # windows.vars verwendet in bestehenden Projekten häufig SSH als Standard.
+    # Ein bloßes Entfernen des Host-Overrides würde diesen abgeschalteten Host
+    # deshalb sofort wieder auf SSH erben lassen. Der absichtlich nicht
+    # existierende Connection-Plugin-Name verhindert Remote-Ausführungen, bis
+    # cmd_ssh_use den Transport nach dem lokalen Starter bewusst neu setzt.
+    host_data["ansible_connection"] = "mavi_disabled"
+
+
 def _apply_ssh_transport(
     project: Path,
     host_data: dict[str, Any],
@@ -144,6 +165,11 @@ def _apply_ssh_transport(
     host_data["ansible_connection"] = "ssh"
     host_data["ansible_shell_type"] = "powershell"
     host_data["ansible_port"] = resolved_port
+    # Der aktive Ansible-Port und -Key werden beim Wechsel auf PSRP ersetzt bzw.
+    # entfernt. Beide SSH-Werte behalten wir deshalb für Host-Key-Audits und
+    # einen späteren, gezielten Rückwechsel ausdrücklich pro Host im Gedächtnis.
+    host_data["mavi_ssh_port"] = resolved_port
+    host_data["mavi_ssh_private_key_file"] = str(resolved_key)
     host_data["ansible_ssh_private_key_file"] = str(resolved_key)
 
     # SSH muss bei Mavi wirklich Key-only sein. Der Windows-Gruppenbereich enthält
@@ -217,6 +243,15 @@ def _apply_psrp_https_transport(
     kerberos_principal: str = "",
 ) -> None:
     """Host erst nach positiver HTTPS-Prüfung dauerhaft auf PSRP TLS umstellen."""
+    # Auch Inventare, die vor Einführung des separaten Mavi-Merkfelds angelegt
+    # wurden, verlieren beim Transportwechsel nicht ihren hostbezogenen Key.
+    active_ssh_key = str(
+        host_data.get("ansible_ssh_private_key_file", "") or ""
+    ).strip()
+    if active_ssh_key:
+        host_data["mavi_ssh_private_key_file"] = str(
+            Path(active_ssh_key).expanduser().resolve()
+        )
     # Ein eventuell host-spezifisch in Vault hinterlegtes PSRP-Passwort darf
     # beim Transportwechsel nicht verloren gehen. SSH-Leerwerte werden nur
     # übernommen, wenn sie zuvor tatsächlich gesetzt waren.
@@ -245,18 +280,28 @@ def _remember_winrm_https_state(
     fqdn: str,
     ca_cert: Path,
     kerberos_principal: str,
+    certificate_thumbprint: str,
+    certificate_not_after: str,
+    root_thumbprint: str,
+    root_not_after: str,
+    pruned_server_certificates: int,
 ) -> None:
     """Nur nach doppeltem Kerberos-Nachweis persistierte Transport-Metadaten."""
-    from .openssh import _sha256_file
 
+    from .openssh import _sha256_file
     host_data["mavi_winrm_https"] = {
-        "version": 1,
+        "version": 2,
         "kerberos_verified": True,
         "auth": "kerberos",
         "fqdn": fqdn,
         "port": int(settings["port"]),
         "kerberos_principal": kerberos_principal,
         "ca_sha256": _sha256_file(ca_cert).lower(),
+        "certificate_thumbprint": _normalized_certificate_thumbprint(certificate_thumbprint),
+        "certificate_not_after": str(certificate_not_after or ""),
+        "root_thumbprint": _normalized_certificate_thumbprint(root_thumbprint),
+        "root_not_after": str(root_not_after or ""),
+        "pruned_server_certificates": max(0, int(pruned_server_certificates)),
     }
 
 
@@ -807,6 +852,73 @@ def _vault_ansible_user_for_host(project: Path, host: str, vault_password_file: 
     return value if isinstance(value, str) else ""
 
 
+def _certificate_thumbprint_from_der(certificate_der: bytes) -> str:
+    """Den Windows-kompatiblen SHA-1-Thumbprint eines DER-Zertifikats liefern."""
+    if not certificate_der:
+        raise ValueError("Das Zertifikat ist leer.")
+    try:
+        digest = hashlib.sha1(certificate_der, usedforsecurity=False)
+    except TypeError:
+        digest = hashlib.sha1(certificate_der)
+    return digest.hexdigest().upper()
+
+
+def _certificate_der_from_file(path: Path) -> bytes:
+    """Ein PEM- oder DER-Zertifikat als kanonische DER-Bytes lesen."""
+    raw = path.read_bytes()
+    if b"-----BEGIN CERTIFICATE-----" in raw:
+        try:
+            return ssl.PEM_cert_to_DER_cert(raw.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"Zertifikat ist kein gültiges PEM: {path}") from exc
+    if not raw:
+        raise ValueError(f"Zertifikat ist leer: {path}")
+    return raw
+
+
+def _certificate_thumbprint_from_file(path: Path) -> str:
+    """PEM- oder DER-Zertifikat exakt in den Windows-Thumbprint überführen."""
+    return _certificate_thumbprint_from_der(_certificate_der_from_file(path))
+
+
+def _certificate_der_base64_from_file(path: Path) -> str:
+    """Öffentliches Zertifikat für einen exakten Remote-Identitätsabgleich kodieren."""
+    return base64.b64encode(_certificate_der_from_file(path)).decode("ascii")
+
+
+def _bootstrap_root_ca_thumbprint(project: Path) -> str:
+    """Den exakten Thumbprint der aktuell von Mavi ausgelieferten Bootstrap-CA liefern."""
+    from .openssh import _bootstrap_pki_paths
+    from .reports import redact_sensitive_text
+
+    paths = _bootstrap_pki_paths(project)
+    candidates = (paths["system_ca"], paths["ca_cert"])
+    errors: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            return _certificate_thumbprint_from_file(candidate)
+        except (OSError, ValueError) as exc:
+            errors.append(redact_sensitive_text(exc))
+    detail = f" ({'; '.join(errors)})" if errors else ""
+    raise RuntimeError(
+        "Die aktuell von Mavi verwendete Bootstrap-CA ist auf dem Controller nicht lesbar. "
+        "Der vollständige Option-11-Rückbau wird nicht mit einer unscharfen Subject-Suche ausgeführt."
+        + detail
+    )
+
+
+def _normalized_certificate_thumbprint(value: Any) -> str:
+    """Nur einen vollständigen Windows-X.509-Thumbprint akzeptieren."""
+    normalized = re.sub(r"\s+", "", str(value or "")).upper()
+    return normalized if re.fullmatch(r"[A-F0-9]{40}", normalized) else ""
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def _winrm_pki_paths(project: Path) -> dict[str, Path]:
     """Pfadlayout der separaten, nie veröffentlichten Mavi-WinRM-CA."""
     from .environment import project_paths
@@ -939,6 +1051,113 @@ def _winrm_leaf_openssl_config(dns_sans: list[str], ip_sans: list[str]) -> str:
     ])
 
 
+def _validate_inventory_host_alias(host: str) -> str:
+    """Auch historisch erlaubte Inventory-Aliase ohne Pfadzeichen validieren."""
+    raw_host = str(host or "")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", raw_host) is None:
+        raise ValueError(
+            "Der Inventory-Hostname darf nur ASCII-Buchstaben, Ziffern, Punkt, Unterstrich "
+            "und Bindestrich enthalten."
+        )
+    return raw_host
+
+
+def _validate_new_host_alias(host: str) -> str:
+    """Die strengere, dateifreundliche Regel ausschließlich für neue Hosts anwenden."""
+    raw_host = str(host or "")
+    if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?", raw_host) is None:
+        raise ValueError(
+            "PC-Name darf nur Buchstaben, Ziffern, Punkt, Unterstrich und Bindestrich enthalten "
+            "und muss mit einem Buchstaben oder einer Ziffer beginnen und enden."
+        )
+    return raw_host
+
+
+def _safe_host_token(host: str) -> str:
+    """Inventory-Alias kollisionsarm und plattformneutral als Dateikomponente abbilden."""
+    raw_host = _validate_inventory_host_alias(host)
+    if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?", raw_host):
+        # Für bereits erzeugte Artefakte regulärer Hosts bleibt der Pfad stabil.
+        return raw_host
+
+    # Alte Inventories durften auch mit Punkt, Unterstrich oder Bindestrich
+    # beginnen/enden. Solche Namen (insbesondere "." und "..") dürfen nie
+    # direkt zu Pfadkomponenten werden. Das @ kann in keinem gültigen alten
+    # Alias vorkommen und trennt den Hash-Namensraum daher von echten Aliasen.
+    digest = hashlib.sha256(raw_host.encode("ascii")).hexdigest()
+    return f"@mavi-legacy-host-{digest}"
+
+
+def _host_artifact_tokens(host: str, *, include_legacy: bool = False) -> tuple[str, ...]:
+    """Aktuellen und optional den historischen Artefakt-Namensraum liefern.
+
+    Neue Dateien werden immer nur unter ``_safe_host_token`` geschrieben. Der
+    zweite Token bildet ausschliesslich den bis v0.8.46 verwendeten
+    ``strip('._-')``-Namensraum fuer die Migration beim Cleanup nach.
+    """
+
+    raw_host = _validate_inventory_host_alias(host)
+    current_token = _safe_host_token(raw_host)
+    tokens = [current_token]
+    if include_legacy:
+        legacy_token = raw_host.strip("._-") or "WINDOWS"
+        if legacy_token != current_token:
+            tokens.append(legacy_token)
+    return tuple(tokens)
+
+
+def _cleanup_host_artifact_tokens(
+    host: str,
+    *,
+    known_hosts: Any = None,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Legacy-Token nur ohne Kollision mit einem anderen Inventory-Host freigeben."""
+
+    raw_host = _validate_inventory_host_alias(host)
+    tokens = _host_artifact_tokens(raw_host, include_legacy=True)
+    if len(tokens) == 1:
+        return tokens, []
+
+    current_token, legacy_token = tokens
+    if known_hosts is None:
+        return (current_token,), [
+            "Der historische Artefakt-Namensraum wurde ohne vollständige Inventory-Hostliste "
+            f"nicht bereinigt: {legacy_token}"
+        ]
+
+    collisions: list[str] = []
+    invalid_alias = False
+    try:
+        inventory_aliases = list(known_hosts)
+    except TypeError:
+        inventory_aliases = []
+        invalid_alias = True
+
+    for candidate in inventory_aliases:
+        candidate_alias = str(candidate or "")
+        if candidate_alias == raw_host:
+            continue
+        try:
+            candidate_tokens = _host_artifact_tokens(candidate_alias, include_legacy=True)
+        except ValueError:
+            invalid_alias = True
+            continue
+        if any(token.casefold() == legacy_token.casefold() for token in candidate_tokens):
+            collisions.append(candidate_alias)
+
+    if invalid_alias or collisions:
+        reason = (
+            "mindestens ein Inventory-Alias ist ungültig"
+            if invalid_alias
+            else "der Namensraum auch zu " + ", ".join(sorted(collisions, key=str.casefold)) + " gehört"
+        )
+        return (current_token,), [
+            "Der historische Artefakt-Namensraum wurde wegen einer möglichen Host-Kollision "
+            f"nicht bereinigt ({legacy_token}: {reason})."
+        ]
+    return tokens, []
+
+
 def _issue_winrm_server_certificate(
     project: Path,
     *,
@@ -953,7 +1172,7 @@ def _issue_winrm_server_certificate(
     )
 
     paths = _ensure_winrm_ca(project)
-    safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(host or "WINDOWS")).strip("._-") or "WINDOWS"
+    safe_host = _safe_host_token(host)
     request_id = secrets.token_hex(12)
     csr_path = paths["requests"] / f"{safe_host}-{request_id}.csr.pem"
     profile_path = paths["profiles"] / f"{safe_host}-{request_id}.cnf"
@@ -1029,26 +1248,94 @@ def _issue_winrm_server_certificate(
     }
 
 
+def _remove_host_bootstrap_artifacts(
+    project: Path,
+    host: str,
+    *,
+    known_hosts: Any = None,
+) -> tuple[int, list[str]]:
+    """Ausschließlich den direkten, Mavi-eigenen Bootstrap-Ordner eines Hosts löschen."""
+    from .openssh import _bootstrap_settings
+    from .reports import redact_sensitive_text
+
+    removed = 0
+    host_tokens, warnings = _cleanup_host_artifact_tokens(host, known_hosts=known_hosts)
+    try:
+        settings = _bootstrap_settings(project)
+    except ValueError as exc:
+        return removed, [
+            "Hostbezogene Bootstrap-Dateien wurden nicht bereinigt, weil die Bootstrap-Konfiguration "
+            f"nicht sicher gelesen werden konnte: {redact_sensitive_text(exc)}"
+        ]
+
+    webroot = Path(settings["local_dir"])
+    host_dirs = [
+        webroot / token
+        for token in host_tokens
+    ]
+    try:
+        if not webroot.exists():
+            return removed, warnings
+        if webroot.is_symlink():
+            return removed, [f"Verknüpfter Bootstrap-Webroot wurde nicht bereinigt: {webroot}"]
+        resolved_webroot = webroot.resolve(strict=True)
+        for host_dir in host_dirs:
+            if not host_dir.exists():
+                continue
+            if host_dir.is_symlink():
+                warnings.append(
+                    f"Verknüpfter Host-Bootstrap-Ordner wurde nicht bereinigt: {host_dir}"
+                )
+                continue
+            resolved_host_dir = host_dir.resolve(strict=True)
+            if resolved_host_dir.parent != resolved_webroot:
+                warnings.append(
+                    f"Unerwarteter Host-Bootstrap-Pfad wurde nicht bereinigt: {resolved_host_dir}"
+                )
+                continue
+            # Diese Pfade werden ausschließlich durch den HTTPS-Bootstrap als
+            # direkte Host-Unterordner angelegt. Der gemeinsame Webroot und die
+            # Bootstrap-CA werden absichtlich nicht rekursiv berührt.
+            removed += sum(1 for _ in resolved_host_dir.rglob("*")) + 1
+            shutil.rmtree(resolved_host_dir)
+    except OSError as exc:
+        warnings.append(
+            "Ein hostbezogener Bootstrap-Ordner konnte nicht entfernt werden: "
+            f"{redact_sensitive_text(exc)}"
+        )
+    return removed, warnings
+
+
 def _remove_host_winrm_certificate_artifacts(
     project: Path,
     host: str,
+    *,
+    keep_request_id: str = "",
+    known_hosts: Any = None,
 ) -> tuple[int, list[str]]:
-    """Nur die eindeutig diesem Host zugeordneten WinRM-PKI-Dateien löschen."""
-    from .reports import redact_sensitive_text
+    """Nur die eindeutig diesem Host zugeordneten WinRM-PKI-Dateien löschen.
 
+    Beim Zertifikatswechsel darf das gerade erfolgreiche Leaf auf dem Controller
+    verbleiben. Beim vollständigen Rückbau wird ohne keep_request_id alles
+    Hostbezogene entfernt; die gemeinsame WinRM-Root-CA bleibt immer erhalten.
+    """
+
+    from .reports import redact_sensitive_text
     paths = _winrm_pki_paths(project)
-    safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(host or "WINDOWS")).strip("._-") or "WINDOWS"
-    escaped_host = re.escape(safe_host)
+    host_tokens, warnings = _cleanup_host_artifact_tokens(host, known_hosts=known_hosts)
+    retained_request = str(keep_request_id or "").strip().lower()
+    if retained_request and not re.fullmatch(r"[a-f0-9]{24}", retained_request):
+        raise ValueError("Die beizubehaltende Mavi-WinRM-Request-ID ist ungültig.")
+    escaped_hosts = "|".join(re.escape(token) for token in host_tokens)
     file_patterns = {
-        "requests": re.compile(rf"^{escaped_host}-[a-f0-9]{{24}}\.csr\.pem$"),
-        "profiles": re.compile(rf"^{escaped_host}-[a-f0-9]{{24}}\.cnf$"),
+        "requests": re.compile(rf"^(?:{escaped_hosts})-[a-f0-9]{{24}}\.csr\.pem$"),
+        "profiles": re.compile(rf"^(?:{escaped_hosts})-[a-f0-9]{{24}}\.cnf$"),
         "certs": re.compile(
-            rf"^(?:{escaped_host}-[a-f0-9]{{24}}\.(?:cert\.pem|cer)|"
-            rf"\.{escaped_host}-[a-f0-9]{{24}}\.cert\.new)$"
+            rf"^(?:(?:{escaped_hosts})-[a-f0-9]{{24}}\.(?:cert\.pem|cer)|"
+            rf"\.(?:{escaped_hosts})-[a-f0-9]{{24}}\.cert\.new)$"
         ),
     }
     removed = 0
-    warnings: list[str] = []
     if paths["root"].is_symlink():
         warnings.append(f"Verknüpfte WinRM-PKI-Basis wurde nicht bereinigt: {paths['root']}")
         return removed, warnings
@@ -1083,6 +1370,8 @@ def _remove_host_winrm_certificate_artifacts(
 
         for candidate in candidates:
             if filename_pattern.fullmatch(candidate.name) is None:
+                continue
+            if retained_request and retained_request in candidate.name.lower():
                 continue
             try:
                 if candidate.is_dir() and not candidate.is_symlink():
@@ -1541,6 +1830,81 @@ def _temporary_psrp_vault_inventory(project: Path, host: str) -> Path | None:
         raise
 
 
+def _retain_single_inventory_host(inventory: dict[str, Any], host: str) -> None:
+    """Alle statischen Inventory-Hostlisten auf genau einen Alias beschränken."""
+
+    def prune_group(group: Any) -> None:
+        if not isinstance(group, dict):
+            return
+        raw_hosts = group.get("hosts")
+        if isinstance(raw_hosts, dict):
+            group["hosts"] = {
+                name: value
+                for name, value in raw_hosts.items()
+                if str(name) == host
+            }
+        elif isinstance(raw_hosts, list):
+            group["hosts"] = [name for name in raw_hosts if str(name) == host]
+        children = group.get("children")
+        if isinstance(children, dict):
+            for child in children.values():
+                prune_group(child)
+
+    for top_level_group in inventory.values():
+        prune_group(top_level_group)
+
+
+def _temporary_single_host_inventory(
+    project: Path,
+    host: str,
+    *,
+    inherit_vault_psrp_credentials: bool = False,
+) -> Path:
+    """Private Inventarkopie erzeugen, in der nur der Zielhost existiert.
+
+    Dadurch bleibt der Aufruf auch dann ein echter Ein-Host-Lauf, wenn der
+    Inventory-Alias mit einem Ansible-Pattern oder Gruppennamen kollidiert.
+    """
+    from .environment import (
+        atomic_write_yaml,
+        project_paths,
+    )
+
+    inventory, _windows, host_data = _host_inventory_entry(project, host)
+    if inherit_vault_psrp_credentials:
+        for key in (
+            "ansible_password",
+            "ansible_ssh_pass",
+            "ansible_ssh_password",
+            "ansible_psrp_password",
+            "ansible_winrm_pass",
+            "ansible_winrm_password",
+        ):
+            value = host_data.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                host_data.pop(key, None)
+
+    _retain_single_inventory_host(inventory, host)
+    source_path = project_paths(project)["inventory"]
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=".mavi-single-host-",
+        suffix=".yml",
+        dir=str(source_path.parent),
+    )
+    os.close(descriptor)
+    temporary_path = Path(raw_path)
+    try:
+        # Neben hosts.yml bleiben group_vars und Vault-Auflösung unverändert
+        # erreichbar; nur weitere Inventory-Hosts fehlen in dieser Kopie.
+        atomic_write_yaml(temporary_path, inventory)
+        if os.name != "nt":
+            os.chmod(temporary_path, 0o600)
+        return temporary_path
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def _vault_psrp_password_for_host(project: Path, host: str, vault_password_file: Path) -> str:
     """Das bestehende Vault-Passwort nur im Speicher für einen Kerberos-TGT lesen.
 
@@ -1777,7 +2141,8 @@ def _open_client_ansible_session(
         or "psrp"
     ).strip().lower()
     auth = str(
-        _effective_host_var(windows, host_data, "ansible_psrp_auth", "") or ""
+        _effective_host_var(windows, host_data, "ansible_psrp_auth", "")
+        or ""
     ).strip().lower()
     saved_state = host_data.get("mavi_winrm_https")
     saved_kerberos = (
@@ -1858,7 +2223,6 @@ def _run_winrm_temporary_play(
     """Kurzlebigen Ansible-Play sicher ausführen und Fehler kompakt schwärzen."""
     from .environment import (
         atomic_write_yaml,
-        project_paths,
     )
     from .execution import strip_ansi
     from .reports import redact_sensitive_text
@@ -1874,9 +2238,12 @@ def _run_winrm_temporary_play(
         playbook_path = Path(raw_path)
         atomic_write_yaml(playbook_path, play)
 
-        if inherit_vault_psrp_credentials:
-            temporary_inventory_path = _temporary_psrp_vault_inventory(project, host)
-        inventory_path = temporary_inventory_path or project_paths(project)["inventory"]
+        temporary_inventory_path = _temporary_single_host_inventory(
+            project,
+            host,
+            inherit_vault_psrp_credentials=inherit_vault_psrp_credentials,
+        )
+        inventory_path = temporary_inventory_path
 
         ansible_executable, ansible_python = _ansible_playbook_runtime()
         runtime_environment = _ansible_runtime_environment(ansible_python)
@@ -1907,7 +2274,6 @@ def _run_winrm_temporary_play(
             str(ansible_executable),
             "-i", str(inventory_path),
             str(playbook_path),
-            "--limit", host,
             "--vault-password-file", str(vault_password_file),
         ]
         if effective_extra_vars:
@@ -2067,6 +2433,396 @@ $Ansible.Changed = $true
             },
         ],
     }]
+
+
+def _extract_json_marker(play_output: str, marker: str) -> dict[str, Any]:
+    """Einen von PowerShell erzeugten, Base64-kodierten JSON-Ergebnismarker prüfen."""
+    escaped_marker = re.escape(str(marker or ""))
+    matches = re.findall(
+        escaped_marker + r"([A-Za-z0-9+/=]+)",
+        str(play_output or ""),
+    )
+    if not matches:
+        raise RuntimeError(f"Der erwartete Mavi-Ergebnismarker fehlt: {marker}")
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Der Mavi-Ergebnismarker {marker} ist nicht eindeutig."
+        )
+    try:
+        decoded = base64.b64decode(matches[0], validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Der Mavi-Ergebnismarker {marker} ist nicht lesbar.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Der Mavi-Ergebnismarker {marker} enthält kein Objekt.")
+    return payload
+
+
+def _bootstrap_certificate_identities(
+    values: list[str] | tuple[str, ...],
+) -> list[tuple[str, str]]:
+    """DER-kodierte Controller-Zertifikate kanonisieren und per SHA-1 benennen."""
+    identities: list[tuple[str, str]] = []
+    by_thumbprint: dict[str, str] = {}
+    for value in values:
+        encoded = str(value or "").strip()
+        try:
+            certificate_der = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Eine Bootstrap-CA ist nicht als gültiges DER/Base64 kodiert.") from exc
+        if not certificate_der or len(certificate_der) > 1024 * 1024:
+            raise ValueError("Eine Bootstrap-CA besitzt eine ungültige DER-Größe.")
+        canonical = base64.b64encode(certificate_der).decode("ascii")
+        thumbprint = _certificate_thumbprint_from_der(certificate_der)
+        existing = by_thumbprint.get(thumbprint)
+        if existing is not None:
+            if not secrets.compare_digest(existing, canonical):
+                raise ValueError("Bootstrap-CA-DER kollidiert unter demselben Thumbprint.")
+            continue
+        by_thumbprint[thumbprint] = canonical
+        identities.append((thumbprint, canonical))
+    return identities
+
+
+def _bootstrap_ca_probe_play(
+    *,
+    current_root_certificate_der_base64: str,
+    candidate_root_certificates_der_base64: list[str],
+    require_current_root: bool = True,
+) -> list[dict[str, Any]]:
+    """Controllergebundene Bootstrap-CA-DER direkt auf dem Zielhost belegen."""
+    current_identities = _bootstrap_certificate_identities(
+        [current_root_certificate_der_base64]
+    )
+    identities = _bootstrap_certificate_identities(
+        [
+            current_root_certificate_der_base64,
+            *candidate_root_certificates_der_base64,
+        ]
+    )
+    if len(current_identities) != 1 or not identities:
+        raise ValueError("Die aktuelle Mavi-Bootstrap-CA besitzt keine gültige DER-Identität.")
+    current_der_base64 = current_identities[0][1]
+    candidates = [encoded for _thumbprint, encoded in identities]
+
+    powershell = r'''[CmdletBinding()]
+param(
+    [string]$CurrentRootCertificateDerBase64,
+    [string[]]$CandidateRootCertificatesDerBase64,
+    [int]$RequireCurrentRootValue = 1
+)
+
+$ErrorActionPreference = 'Stop'
+$requireCurrentRoot = ($RequireCurrentRootValue -eq 1)
+$expectedRoots = [ordered]@{}
+foreach ($encodedCandidate in @($CandidateRootCertificatesDerBase64)) {
+    try {
+        [byte[]]$expectedDer = [Convert]::FromBase64String(([string]$encodedCandidate).Trim())
+        if ($expectedDer.Count -eq 0 -or $expectedDer.Count -gt 1MB) {
+            throw 'ungültige DER-Größe'
+        }
+        $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $expectedDer
+        )
+    }
+    catch {
+        throw 'Mavi Bootstrap-Nachweis: Eine controllerseitige Root-CA ist kein gültiges DER-Zertifikat.'
+    }
+    $thumbprint = (([string]$expectedCertificate.Thumbprint) -replace '\s', '').ToUpperInvariant()
+    if ($thumbprint -notmatch '^[A-F0-9]{40}$') {
+        throw 'Mavi Bootstrap-Nachweis: Eine controllerseitige Root-CA besitzt keinen gültigen Fingerabdruck.'
+    }
+    $basicConstraints = @(
+        $expectedCertificate.Extensions |
+        Where-Object { $_.Oid.Value -eq '2.5.29.19' }
+    ) | Select-Object -First 1
+    if ($null -eq $basicConstraints) {
+        throw 'Mavi Bootstrap-Nachweis: Das erwartete Zertifikat besitzt keine CA-BasicConstraints.'
+    }
+    $decodedConstraints = [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new()
+    $decodedConstraints.CopyFrom($basicConstraints)
+    if (-not $decodedConstraints.CertificateAuthority) {
+        throw 'Mavi Bootstrap-Nachweis: Das erwartete Zertifikat ist keine CA.'
+    }
+    $canonicalDerBase64 = [Convert]::ToBase64String($expectedCertificate.RawData)
+    if ($expectedRoots.Contains($thumbprint)) {
+        if ([string]$expectedRoots[$thumbprint] -cne $canonicalDerBase64) {
+            throw 'Mavi Bootstrap-Nachweis: Zwei Controller-Zertifikate kollidieren unter demselben Thumbprint.'
+        }
+        continue
+    }
+    $expectedRoots[$thumbprint] = $canonicalDerBase64
+}
+if ($expectedRoots.Count -eq 0) {
+    throw 'Mavi Bootstrap-Nachweis: Es wurden keine controllergebundenen Root-Identitäten übergeben.'
+}
+try {
+    $currentCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [Convert]::FromBase64String($CurrentRootCertificateDerBase64.Trim())
+    )
+}
+catch {
+    throw 'Mavi Bootstrap-Nachweis: Die aktuelle controllerseitige Root-CA ist ungültig.'
+}
+$CurrentRootThumbprint = (([string]$currentCertificate.Thumbprint) -replace '\s', '').ToUpperInvariant()
+$currentDerBase64 = [Convert]::ToBase64String($currentCertificate.RawData)
+if (
+    $CurrentRootThumbprint -notmatch '^[A-F0-9]{40}$' -or
+    -not $expectedRoots.Contains($CurrentRootThumbprint) -or
+    [string]$expectedRoots[$CurrentRootThumbprint] -cne $currentDerBase64
+) {
+    throw 'Mavi Bootstrap-Nachweis: Die aktuelle Root-CA gehört nicht zum controllergebundenen Zertifikatssatz.'
+}
+$CandidateRootThumbprints = @($expectedRoots.Keys)
+
+$presentThumbprints = @()
+foreach ($thumbprint in $CandidateRootThumbprints) {
+    $certificate = Get-Item -LiteralPath ("Cert:\LocalMachine\Root\$thumbprint") -ErrorAction SilentlyContinue
+    if ($null -eq $certificate) {
+        continue
+    }
+    $actualThumbprint = (([string]$certificate.Thumbprint) -replace '\s', '').ToUpperInvariant()
+    if (-not $actualThumbprint.Equals($thumbprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Mavi Bootstrap-Nachweis: Zertifikatspfad und Zertifikat-Fingerabdruck widersprechen sich.'
+    }
+    $actualDerBase64 = [Convert]::ToBase64String($certificate.RawData)
+    if ($actualDerBase64 -cne [string]$expectedRoots[$thumbprint]) {
+        throw 'Mavi Bootstrap-Nachweis: Das Root-Store-Zertifikat stimmt nicht bytegenau mit der Controller-CA überein.'
+    }
+    $presentThumbprints += $actualThumbprint
+}
+
+if ($requireCurrentRoot -and $presentThumbprints -notcontains $CurrentRootThumbprint) {
+    throw 'Mavi Bootstrap-Nachweis: Die aktuell veröffentlichte Bootstrap-CA ist auf diesem Windows-Host nicht installiert.'
+}
+if (-not $requireCurrentRoot -and @($presentThumbprints).Count -eq 0) {
+    throw 'Mavi Bootstrap-Nachweis: Keine der exakt bekannten Bootstrap-CAs ist auf diesem Windows-Host installiert.'
+}
+
+$result = [ordered]@{
+    CurrentRootThumbprint = $CurrentRootThumbprint
+    PresentRootThumbprints = @($presentThumbprints)
+}
+$marker = [Convert]::ToBase64String(
+    [System.Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Depth 4 -Compress))
+)
+$Ansible.Result = @{ Marker = $marker }
+$Ansible.Changed = $false
+'''
+    return [{
+        "name": "Mavi Bootstrap-CA direkt auf dem Windows-Host belegen",
+        "hosts": "windows",
+        "gather_facts": False,
+        "tasks": [
+            {
+                "name": "Exakte Mavi-Bootstrap-CA im Windows Root Store prüfen",
+                "ansible.windows.win_powershell": {
+                    "error_action": "stop",
+                    "script": powershell,
+                    "parameters": {
+                        "CurrentRootCertificateDerBase64": current_der_base64,
+                        "CandidateRootCertificatesDerBase64": candidates,
+                        "RequireCurrentRootValue": 1 if require_current_root else 0,
+                    },
+                },
+                "register": "mavi_bootstrap_ca_probe",
+            },
+            {
+                "name": "Mavi Bootstrap-CA-Nachweis auslesen",
+                "ansible.builtin.debug": {
+                    "msg": "Mavi_BOOTSTRAP_CA_B64={{ mavi_bootstrap_ca_probe.result.Marker }}",
+                },
+            },
+        ],
+    }]
+
+
+def _extract_bootstrap_ca_probe_result(
+    play_output: str,
+    *,
+    require_current_root: bool = True,
+) -> dict[str, Any]:
+    """Den hostseitigen Bootstrap-CA-Nachweis strikt validieren."""
+    payload = _extract_json_marker(play_output, "Mavi_BOOTSTRAP_CA_B64=")
+    current = _normalized_certificate_thumbprint(payload.get("CurrentRootThumbprint"))
+    raw_present = payload.get("PresentRootThumbprints")
+    if isinstance(raw_present, str):
+        raw_present = [raw_present]
+    if not isinstance(raw_present, list):
+        raise RuntimeError("Der Mavi-Bootstrap-Nachweis enthält keine gültige CA-Liste.")
+    present: list[str] = []
+    for value in raw_present:
+        thumbprint = _normalized_certificate_thumbprint(value)
+        if not thumbprint:
+            raise RuntimeError("Der Mavi-Bootstrap-Nachweis enthält einen ungültigen CA-Fingerabdruck.")
+        if thumbprint not in present:
+            present.append(thumbprint)
+    if not current:
+        raise RuntimeError("Der Mavi-Bootstrap-Nachweis enthält keine gültige Bezugs-CA.")
+    if require_current_root and current not in present:
+        raise RuntimeError(
+            "Der Mavi-Bootstrap-Nachweis bestätigt die aktuelle CA nicht auf dem Zielhost."
+        )
+    if not present:
+        raise RuntimeError(
+            "Der Mavi-Bootstrap-Nachweis bestätigt keine der exakt bekannten CAs auf dem Zielhost."
+        )
+    return {
+        "current_root_thumbprint": current,
+        "present_root_thumbprints": present,
+    }
+
+
+def _normalized_certificate_timestamp(value: Any, *, label: str) -> str:
+    """Ein mit Zeitzone geliefertes Zertifikatsablaufdatum in UTC normalisieren."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError(f"{label} fehlt.")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError(f"{label} ist kein gültiges ISO-8601-Datum.") from exc
+    if parsed.tzinfo is None:
+        raise RuntimeError(f"{label} enthält keine Zeitzone.")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _marker_nonnegative_int(payload: dict[str, Any], field: str) -> int:
+    value = payload.get(field)
+    if isinstance(value, bool):
+        raise RuntimeError(f"Der Mavi-Ergebniswert {field} ist ungültig.")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Der Mavi-Ergebniswert {field} fehlt oder ist ungültig.") from exc
+    if normalized < 0:
+        raise RuntimeError(f"Der Mavi-Ergebniswert {field} darf nicht negativ sein.")
+    return normalized
+
+
+def _extract_winrm_https_install_result(play_output: str) -> dict[str, Any]:
+    """Den Abschlussbeleg der Windows-HTTPS-Installation strikt validieren."""
+    payload = _extract_json_marker(play_output, "Mavi_WINRM_HTTPS_B64=")
+    thumbprint = _normalized_certificate_thumbprint(payload.get("Thumbprint"))
+    root_thumbprint = _normalized_certificate_thumbprint(payload.get("RootThumbprint"))
+    certificate_sha256 = str(payload.get("CertificateSha256", "") or "").strip().lower()
+    fqdn = str(payload.get("Fqdn", "") or "").strip().lower()
+    if not thumbprint or not root_thumbprint:
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg enthält keinen gültigen Zertifikat-Thumbprint.")
+    if not re.fullmatch(r"[a-f0-9]{64}", certificate_sha256):
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg enthält keinen gültigen Zertifikat-SHA-256.")
+    if not fqdn:
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg enthält keinen FQDN.")
+    try:
+        port = int(payload.get("Port"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg enthält keinen gültigen Port.") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg enthält einen ungültigen Port.")
+    if payload.get("KerberosOnly") is not True or payload.get("Http5985Blocked") is not True:
+        raise RuntimeError("Der Mavi-WinRM-HTTPS-Abschlussbeleg bestätigt nicht den Kerberos-only-Endzustand.")
+    return {
+        "thumbprint": thumbprint,
+        "root_thumbprint": root_thumbprint,
+        "certificate_sha256": certificate_sha256,
+        "certificate_not_after": _normalized_certificate_timestamp(
+            payload.get("NotAfterUtc"),
+            label="Das Ablaufdatum des Mavi-WinRM-Serverzertifikats",
+        ),
+        "root_not_after": _normalized_certificate_timestamp(
+            payload.get("RootNotAfterUtc"),
+            label="Das Ablaufdatum der Mavi-WinRM-Root-CA",
+        ),
+        "pruned_server_certificates": _marker_nonnegative_int(payload, "PrunedServerCertificates"),
+        "fqdn": fqdn,
+        "port": port,
+    }
+
+
+def _extract_winrm_reset_result(play_output: str) -> dict[str, Any]:
+    """Den atomaren Rückbau-Nachweis des Windows-Hosts validieren."""
+    payload = _extract_json_marker(play_output, "Mavi_REMOTE_RESET_B64=")
+    raw_bootstrap_thumbprints = payload.get("BootstrapRootThumbprints")
+    if isinstance(raw_bootstrap_thumbprints, str):
+        raw_bootstrap_thumbprints = [raw_bootstrap_thumbprints]
+    if not isinstance(raw_bootstrap_thumbprints, list):
+        raw_bootstrap_thumbprints = [payload.get("BootstrapRootThumbprint")]
+    bootstrap_thumbprints: list[str] = []
+    for value in raw_bootstrap_thumbprints:
+        thumbprint = _normalized_certificate_thumbprint(value)
+        if str(value or "").strip() and not thumbprint:
+            raise RuntimeError(
+                "Der Mavi-Rückbau-Nachweis enthält einen ungültigen Bootstrap-CA-Fingerabdruck."
+            )
+        if thumbprint and thumbprint not in bootstrap_thumbprints:
+            bootstrap_thumbprints.append(thumbprint)
+    result = {
+        "removed_listeners": _marker_nonnegative_int(payload, "RemovedListeners"),
+        "removed_certificates": _marker_nonnegative_int(payload, "RemovedCertificates"),
+        "removed_firewall_rules": _marker_nonnegative_int(payload, "RemovedFirewallRules"),
+        "removed_openssh_firewall_rules": _marker_nonnegative_int(
+            payload, "RemovedOpenSshFirewallRules"
+        ),
+        "removed_openssh_keys": _marker_nonnegative_int(payload, "RemovedOpenSshKeys"),
+        "removed_openssh_config_backups": _marker_nonnegative_int(
+            payload, "RemovedOpenSshConfigBackups"
+        ),
+        "removed_bootstrap_certificates": _marker_nonnegative_int(
+            payload, "RemovedBootstrapCertificates"
+        ),
+        "bootstrap_scope_verified": payload.get("BootstrapScopeVerified") is True,
+        "openssh_disable_scheduled": payload.get("OpenSshDisableScheduled") is True,
+        "openssh_startup_disabled": payload.get("OpenSshStartupDisabled") is True,
+        "openssh_stopped_verified": payload.get("OpenSshStoppedVerified") is True,
+        "openssh_state": str(payload.get("OpenSshState", "") or ""),
+        "openssh_start_mode": str(payload.get("OpenSshStartMode", "") or ""),
+        "winrm_state": str(payload.get("WinRMState", "") or ""),
+        "winrm_start_mode": str(payload.get("WinRMStartMode", "") or ""),
+        "winrm_scope_verified": payload.get("WinRmScopeVerified") is True,
+        "winrm_listeners_cleared": payload.get("WinRmListenersCleared") is True,
+        "preserved_foreign_winrm_listeners": _marker_nonnegative_int(
+            payload, "PreservedForeignWinRmListeners"
+        ),
+        "winrm_root_thumbprint": _normalized_certificate_thumbprint(
+            payload.get("WinRmRootThumbprint")
+        ),
+        "bootstrap_root_thumbprint": _normalized_certificate_thumbprint(
+            payload.get("BootstrapRootThumbprint")
+        ),
+        "bootstrap_root_thumbprints": bootstrap_thumbprints,
+    }
+    if result["winrm_state"].casefold() != "stopped" or result["winrm_start_mode"].casefold() != "disabled":
+        raise RuntimeError("Der Mavi-Rückbau-Nachweis bestätigt keinen gestoppten und deaktivierten WinRM-Dienst.")
+    if result["winrm_listeners_cleared"] != (
+        result["preserved_foreign_winrm_listeners"] == 0
+    ):
+        raise RuntimeError(
+            "Der Mavi-Rückbau-Nachweis widerspricht sich beim verbleibenden WinRM-Listener-Bestand."
+        )
+    if result["openssh_stopped_verified"] != (
+        result["openssh_state"].casefold() == "stopped"
+    ):
+        raise RuntimeError(
+            "Der Mavi-Rückbau-Nachweis widerspricht sich beim tatsächlichen sshd-Endzustand."
+        )
+    if result["openssh_startup_disabled"] != (
+        result["openssh_start_mode"].casefold() == "disabled"
+    ):
+        raise RuntimeError(
+            "Der Mavi-Rückbau-Nachweis widerspricht sich beim sshd-Startmodus."
+        )
+    if result["bootstrap_scope_verified"] and not result["bootstrap_root_thumbprints"]:
+        raise RuntimeError(
+            "Der Mavi-Rückbau-Nachweis bestätigt eine Bootstrap-Bereinigung ohne exakte CA-Identität."
+        )
+    if (
+        result["bootstrap_root_thumbprints"]
+        and result["bootstrap_root_thumbprint"] != result["bootstrap_root_thumbprints"][0]
+    ):
+        raise RuntimeError(
+            "Der Mavi-Rückbau-Nachweis widerspricht sich bei der primären Bootstrap-CA."
+        )
+    return result
 
 
 def _extract_winrm_csr(play_output: str) -> bytes:
@@ -2382,6 +3138,32 @@ foreach ($rule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action
 foreach ($rule in @($httpFirewallAllowRules | Select-Object -Unique)) {
     Disable-NetFirewallRule -InputObject $rule -ErrorAction Stop | Out-Null
 }
+
+# Den exakten Listener noch prüfen, solange der lokale WSMan-Provider über
+# das vollständig netzwerkisolierte Negotiate-Fenster erreichbar ist. Nach dem
+# anschließenden Kerberos-only-Neustart darf dieser Prozess den Provider nicht
+# erneut öffnen; genau das scheitert auf korrekt gehärteten Hosts erwartbar.
+$finalHttpsListeners = @(
+    Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop |
+    Where-Object { $_.Keys -contains 'Transport=HTTPS' }
+)
+if ($finalHttpsListeners.Count -ne 1) {
+    throw 'Mavi WinRM TLS: Der finale HTTPS-Listener ist nicht eindeutig.'
+}
+$finalListenerValues = @{}
+foreach ($listenerValue in @(Get-ChildItem -LiteralPath $finalHttpsListeners[0].PSPath -ErrorAction Stop)) {
+    $listenerValueName = [string]$listenerValue.Name
+    if (-not [string]::IsNullOrWhiteSpace($listenerValueName)) {
+        $finalListenerValues[$listenerValueName] = [string]$listenerValue.Value
+    }
+}
+$finalListenerThumbprint = ([string]$finalListenerValues['CertificateThumbprint']).Trim() -replace '\s', ''
+if (
+    $finalListenerThumbprint -notmatch '^[a-fA-F0-9]{40}$' -or
+    -not $finalListenerThumbprint.Equals($selected.Thumbprint, [System.StringComparison]::OrdinalIgnoreCase)
+) {
+    throw 'Mavi WinRM TLS: Der finale HTTPS-Listener verwendet nicht das gerade bestätigte Mavi-Serverzertifikat.'
+}
 }
 finally {
     # Diese ADMX-gestützten Dienstwerte sind die fail-closed Endstellung.
@@ -2418,14 +3200,132 @@ if ($remainingHttpAllowRules.Count -gt 0) {
     throw 'SICHERHEITSABBRUCH: mindestens eine TCP/5985-Firewallfreigabe ist weiterhin aktiv.'
 }
 
-# Erst nach dem finalen Service-Neustart fällt die Setup-Isolation für 5986.
-# Die enge Allow-Regel von ausschließlich der Ansible-IP bleibt bestehen.
+# Nach dem Kerberos-only-Neustart ausschließlich providerunabhängig prüfen.
+# Der exakte Listener wurde unmittelbar davor geprüft; ein laufender Dienst,
+# korrekter Starttyp und lokaler Listen-Socket belegen, dass WinRM die
+# persistierte Konfiguration wieder erfolgreich geladen hat. Die zwei echten
+# PSRP/Kerberos-Nachweise des Controllers bleiben der abschließende End-to-End-
+# Beweis, bevor das Inventory auf PSRP umgestellt wird.
+$finalWinRmService = Get-Service -Name WinRM -ErrorAction Stop
+$finalWinRmStartValue = [int](Get-ItemPropertyValue `
+    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM' `
+    -Name Start `
+    -ErrorAction Stop
+)
+if (
+    [string]$finalWinRmService.Status -ne 'Running' -or
+    $finalWinRmStartValue -ne 2
+) {
+    throw 'Mavi WinRM TLS: WinRM läuft nach dem Kerberos-only-Neustart nicht im erwarteten automatischen Zustand.'
+}
+$finalSocketDeadline = (Get-Date).AddSeconds(15)
+$finalWinRmTcpListeners = @()
+do {
+    $finalWinRmTcpListeners = @(
+        Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort $Port `
+            -ErrorAction SilentlyContinue
+    )
+    if ($finalWinRmTcpListeners.Count -gt 0) { break }
+    Start-Sleep -Milliseconds 250
+} while ((Get-Date) -lt $finalSocketDeadline)
+if ($finalWinRmTcpListeners.Count -eq 0) {
+    throw "Mavi WinRM TLS: Nach dem Kerberos-only-Neustart lauscht kein lokaler Endpunkt auf TCP/$Port."
+}
+
+# Erst nach dem nachgewiesenen Listenerwechsel werden ausschließlich ältere,
+# eindeutig Mavi-eigene Serverzertifikate desselben Mavi-Root-Zertifikats und
+# desselben Ziel-FQDN entfernt. Das neue Leaf bleibt immer erhalten; fremde
+# CAs sowie Mavi-Leaves anderer Endpunkte bleiben unangetastet.
+function Test-MaviManagedLeafForRoot {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot,
+        [string]$ExpectedFqdn
+    )
+    $expectedFriendlyName = "Mavi WinRM HTTPS $ExpectedFqdn"
+    if (
+        $null -eq $Certificate -or
+        $null -eq $ExpectedRoot -or
+        [string]::IsNullOrWhiteSpace($ExpectedFqdn) -or
+        -not ([string]$Certificate.FriendlyName).Equals(
+            $expectedFriendlyName,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        return $false
+    }
+    $subjectName = [string]$Certificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+        $false
+    )
+    if (-not $subjectName.Equals($ExpectedFqdn, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.VerificationFlags = (
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority -bor
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+        )
+        [void]$chain.ChainPolicy.ExtraStore.Add($ExpectedRoot)
+        if (-not $chain.Build($Certificate) -or $chain.ChainElements.Count -lt 2) {
+            return $false
+        }
+        $chainRoot = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+        return (
+            ([string]$chainRoot.Thumbprint).Equals(
+                [string]$ExpectedRoot.Thumbprint,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [Convert]::ToBase64String($chainRoot.RawData) -ceq
+                [Convert]::ToBase64String($ExpectedRoot.RawData)
+        )
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
+$prunedServerCertificates = 0
+$selectedThumbprint = ([string]$selected.Thumbprint).ToUpperInvariant()
+foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
+    if (-not (Test-Path -LiteralPath $storePath)) { continue }
+    foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction SilentlyContinue)) {
+        $certificateThumbprint = ([string]$certificate.Thumbprint).ToUpperInvariant()
+        if ($certificateThumbprint.Equals($selectedThumbprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        if (Test-MaviManagedLeafForRoot -Certificate $certificate -ExpectedRoot $rootCertificate -ExpectedFqdn $Fqdn) {
+            if ($certificate.HasPrivateKey) {
+                Remove-Item -LiteralPath $certificate.PSPath -DeleteKey -Force -ErrorAction Stop
+            }
+            else {
+                Remove-Item -LiteralPath $certificate.PSPath -Force -ErrorAction Stop
+            }
+            $prunedServerCertificates++
+        }
+    }
+}
+
+# Erst nachdem alle falliblen lokalen Nachweise und Bereinigungen erfolgreich
+# sind, fällt die Setup-Isolation für 5986. Die enge Allow-Regel ausschließlich
+# von der Ansible-IP bleibt bestehen.
 Get-NetFirewallRule -DisplayName $setupIsolationRuleName -ErrorAction Stop |
     Remove-NetFirewallRule -ErrorAction Stop
 
 $result = [ordered]@{
     Thumbprint = $selected.Thumbprint
     CertificateSha256 = $actualSha256.ToLowerInvariant()
+    RootThumbprint = $rootCertificate.Thumbprint
+    NotAfterUtc = $selected.NotAfter.ToUniversalTime().ToString('o')
+    RootNotAfterUtc = $rootCertificate.NotAfter.ToUniversalTime().ToString('o')
+    PrunedServerCertificates = $prunedServerCertificates
     Fqdn = $Fqdn
     Port = $Port
     FirewallRule = $RuleName
@@ -2558,29 +3458,111 @@ $Ansible.Changed = ($httpListeners.Count -gt 0)
 def _winrm_reset_play(
     *,
     root_thumbprint: str,
+    root_certificate_der_base64: str = "",
+    expected_fqdn: str = "",
+    bootstrap_root_certificates_der_base64: list[str] | None = None,
     disable_openssh: bool = False,
     public_key_prefix: str = "",
     key_marker: str = "",
     openssh_firewall_rule: str = "",
+    openssh_config_backup: str = "",
 ) -> list[dict[str, Any]]:
     """Mavi-WinRM über den unabhängigen OpenSSH-Kanal auf Stand 0 setzen."""
+    bootstrap_identities = _bootstrap_certificate_identities(
+        list(bootstrap_root_certificates_der_base64 or [])
+    )
+    normalized_bootstrap_certificates = [
+        encoded for _thumbprint, encoded in bootstrap_identities
+    ]
     powershell = r'''[CmdletBinding()]
 param(
     [string]$RootThumbprint = '',
+    [string]$RootCertificateDerBase64 = '',
+    [string]$ExpectedFqdn = '',
+    [string[]]$BootstrapRootCertificatesDerBase64 = @(),
     [int]$DisableOpenSshValue = 0,
     [string]$CurrentKeyPrefix = '',
     [string]$CurrentKeyMarker = '',
-    [string]$OpenSshFirewallRuleName = ''
+    [string]$OpenSshFirewallRuleName = '',
+    [string]$OpenSshConfigBackupPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $disableOpenSsh = ($DisableOpenSshValue -eq 1)
 $RootThumbprint = ($RootThumbprint -replace '\s', '').ToUpperInvariant()
+$ExpectedFqdn = $ExpectedFqdn.Trim().TrimEnd('.')
 if (-not [string]::IsNullOrWhiteSpace($RootThumbprint) -and $RootThumbprint -notmatch '^[A-F0-9]{40}$') {
     throw 'Mavi WinRM Reset: Der Root-CA-Fingerabdruck ist ungültig.'
 }
-if ($disableOpenSsh -and $OpenSshFirewallRuleName -notmatch '^[A-Za-z0-9_.-]{1,255}$') {
-    throw 'Mavi Remote-Aus: Der Name der OpenSSH-Firewallregel ist ungültig.'
+$OpenSshConfigBackupPath = $OpenSshConfigBackupPath.Trim().Replace('/', '\')
+if ($disableOpenSsh) {
+    $backupPathPattern = '^MaviProvisioner\\bootstrap\\(?<InstanceId>[a-z0-9-]{1,64})\\sshd_config[.]pre-mavi[.]bak$'
+    $backupPathMatch = [regex]::Match(
+        $OpenSshConfigBackupPath,
+        $backupPathPattern,
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $backupPathMatch.Success) {
+        throw 'Mavi Remote-Aus: Der instanzgebundene OpenSSH-Sicherungspfad ist ungültig.'
+    }
+    $expectedOpenSshFirewallRuleName = (
+        'Mavi-OpenSSH-' + $backupPathMatch.Groups['InstanceId'].Value + '-Ansible-In-TCP'
+    )
+    if (-not $OpenSshFirewallRuleName.Equals(
+        $expectedOpenSshFirewallRuleName,
+        [System.StringComparison]::Ordinal
+    )) {
+        throw 'Mavi Remote-Aus: Die OpenSSH-Firewallregel gehört nicht zur angegebenen Bootstrap-Instanz.'
+    }
+}
+$expectedBootstrapRoots = [ordered]@{}
+foreach ($encodedBootstrapRoot in @($BootstrapRootCertificatesDerBase64)) {
+    try {
+        [byte[]]$expectedBootstrapDer = [Convert]::FromBase64String(
+            ([string]$encodedBootstrapRoot).Trim()
+        )
+        if ($expectedBootstrapDer.Count -eq 0 -or $expectedBootstrapDer.Count -gt 1MB) {
+            throw 'ungültige DER-Größe'
+        }
+        $expectedBootstrapCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $expectedBootstrapDer
+        )
+    }
+    catch {
+        throw 'Mavi Remote-Aus: Eine controllerseitige Bootstrap-CA ist kein gültiges DER-Zertifikat.'
+    }
+    $bootstrapRootThumbprint = (
+        ([string]$expectedBootstrapCertificate.Thumbprint) -replace '\s', ''
+    ).ToUpperInvariant()
+    if ($bootstrapRootThumbprint -notmatch '^[A-F0-9]{40}$') {
+        throw 'Mavi Remote-Aus: Eine controllerseitige Bootstrap-CA besitzt keinen gültigen Fingerabdruck.'
+    }
+    $bootstrapBasicConstraints = @(
+        $expectedBootstrapCertificate.Extensions |
+        Where-Object { $_.Oid.Value -eq '2.5.29.19' }
+    ) | Select-Object -First 1
+    if ($null -eq $bootstrapBasicConstraints) {
+        throw 'Mavi Remote-Aus: Eine erwartete Bootstrap-CA besitzt keine CA-BasicConstraints.'
+    }
+    $decodedBootstrapConstraints = [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new()
+    $decodedBootstrapConstraints.CopyFrom($bootstrapBasicConstraints)
+    if (-not $decodedBootstrapConstraints.CertificateAuthority) {
+        throw 'Mavi Remote-Aus: Ein erwartetes Bootstrap-Zertifikat ist keine CA.'
+    }
+    $canonicalBootstrapDerBase64 = [Convert]::ToBase64String(
+        $expectedBootstrapCertificate.RawData
+    )
+    if ($expectedBootstrapRoots.Contains($bootstrapRootThumbprint)) {
+        if ([string]$expectedBootstrapRoots[$bootstrapRootThumbprint] -cne $canonicalBootstrapDerBase64) {
+            throw 'Mavi Remote-Aus: Zwei Controller-Zertifikate kollidieren unter demselben Thumbprint.'
+        }
+        continue
+    }
+    $expectedBootstrapRoots[$bootstrapRootThumbprint] = $canonicalBootstrapDerBase64
+}
+$BootstrapRootThumbprints = @($expectedBootstrapRoots.Keys)
+if ($disableOpenSsh -and @($BootstrapRootThumbprints).Count -eq 0) {
+    throw 'Mavi Remote-Aus: Die controllergebundenen Mavi-Bootstrap-CA-Zertifikate fehlen.'
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -2589,14 +3571,6 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
     throw "Mavi WinRM Reset benötigt einen erhöhten lokalen Administrator-Token; aktuell: $($identity.Name)"
 }
 
-$policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
-$policyNames = @(
-    'AllowUnencryptedTraffic',
-    'AllowKerberos',
-    'AllowNegotiate',
-    'AllowBasic',
-    'AllowCredSSP'
-)
 $firewallNames = @(
     'Mavi-WinRM-HTTPS-Ansible-In-TCP',
     'Mavi-WinRM-HTTP-Dauerhaft-Block-TCP',
@@ -2607,174 +3581,791 @@ $removedListeners = 0
 $removedCertificates = 0
 $removedFirewallRules = 0
 $removedOpenSshKeys = 0
+$removedOpenSshFirewallRules = 0
+$removedOpenSshConfigBackups = 0
+$removedBootstrapCertificates = 0
+$bootstrapScopeVerified = $false
 $openSshDisableScheduled = $false
-$remainingListeners = -1
+$openSshStartupDisabled = $false
+$openSshStoppedVerified = $false
+$openSshState = ''
+$openSshStartMode = ''
+$remainingMaviListeners = -1
+$remainingMaviCertificates = -1
+$preservedWinRmListeners = -1
+$winRmListenersCleared = $false
 $cleanupError = $null
-
-try {
-    # Ein Mavi-Endzustand blockiert Negotiate per Richtlinie. Für die lokale
-    # WSMan:-Verwaltung über die unabhängige SSH-Sitzung wird es kurz aktiviert.
-    New-Item -Path $policyPath -Force | Out-Null
-    Set-ItemProperty -Path $policyPath -Name AllowNegotiate -Type DWord -Value 1 -Force
-    Set-Service -Name WinRM -StartupType Manual -ErrorAction Stop
-    Start-Service -Name WinRM -ErrorAction SilentlyContinue
-    Restart-Service -Name WinRM -Force -ErrorAction Stop
-
-    Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $false -Force -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $false -Force -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\Kerberos -Value $true -Force -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\Negotiate -Value $true -Force -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\Certificate -Value $false -Force -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $false -Force -ErrorAction Stop
-
-    $listeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
-    foreach ($listener in $listeners) {
-        Remove-Item -LiteralPath $listener.PSPath -Recurse -Force -ErrorAction Stop
-        $removedListeners++
-    }
-    # Den WSMan-Provider nur abfragen, solange WinRM noch läuft. Ein Zugriff
-    # nach Stop/Disable kann lokal bis zum Ansible-Timeout blockieren.
-    $remainingListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop).Count
-    if ($remainingListeners -ne 0) {
-        throw 'Mavi WinRM Reset: Nicht alle WinRM-Listener konnten entfernt werden.'
-    }
-
-    foreach ($name in $firewallNames) {
-        $rules = @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)
-        foreach ($rule in $rules) {
-            Remove-NetFirewallRule -InputObject $rule -ErrorAction Stop
-            $removedFirewallRules++
-        }
-    }
-
-    $effectiveRootThumbprint = $RootThumbprint
-    $remoteRootPath = Join-Path $workDirectory 'mavi-winrm-root-ca.cer'
-    if ([string]::IsNullOrWhiteSpace($effectiveRootThumbprint) -and (Test-Path -LiteralPath $remoteRootPath -PathType Leaf)) {
-        $remoteRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($remoteRootPath)
-        $effectiveRootThumbprint = ([string]$remoteRoot.Thumbprint).ToUpperInvariant()
-    }
-
-    $rootSubject = ''
-    if ($effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
-        $rootCertificate = Get-Item -LiteralPath ("Cert:\LocalMachine\Root\$effectiveRootThumbprint") -ErrorAction SilentlyContinue
-        if ($null -ne $rootCertificate) {
-            $rootSubject = [string]$rootCertificate.Subject
-        }
-    }
-
-    foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
-        if (-not (Test-Path -LiteralPath $storePath)) { continue }
-        foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction SilentlyContinue)) {
-            $isMaviLeaf = ([string]$certificate.FriendlyName) -like 'Mavi WinRM HTTPS *'
-            if (-not [string]::IsNullOrWhiteSpace($rootSubject)) {
-                $isMaviLeaf = $isMaviLeaf -or ([string]$certificate.Issuer).Equals(
-                    $rootSubject,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            }
-            if ($isMaviLeaf) {
-                Remove-Item -LiteralPath $certificate.PSPath -Force -ErrorAction Stop
-                $removedCertificates++
-            }
-        }
-    }
-
-    if ($effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
-        $rootPath = "Cert:\LocalMachine\Root\$effectiveRootThumbprint"
-        if (Test-Path -LiteralPath $rootPath) {
-            Remove-Item -LiteralPath $rootPath -Force -ErrorAction Stop
-            $removedCertificates++
-        }
-    }
-
-    if (Test-Path -LiteralPath $workDirectory) {
-        Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction Stop
-    }
-}
-catch {
-    $cleanupError = $_.Exception.Message
-}
-finally {
-    if (Test-Path -LiteralPath $policyPath) {
-        foreach ($name in $policyNames) {
-            Remove-ItemProperty -LiteralPath $policyPath -Name $name -Force -ErrorAction SilentlyContinue
-        }
-    }
-    Stop-Service -Name WinRM -Force -ErrorAction SilentlyContinue
-    Set-Service -Name WinRM -StartupType Disabled -ErrorAction Stop
-}
-
-if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
-    throw "Mavi WinRM Reset wurde nicht vollständig ausgeführt: $cleanupError"
-}
-
-$service = Get-Service -Name WinRM -ErrorAction Stop
-$serviceStartValue = [int](Get-ItemPropertyValue `
-    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM' `
+$winRmMutationStarted = $false
+$winRmMaintenanceAttempted = $false
+$winRmListenerSnapshots = @()
+$winRmFirewallSnapshots = @()
+$winRmCertificateSnapshots = @()
+$workDirectoryFileSnapshots = @()
+$workDirectoryDirectories = @()
+$workDirectorySnapshotCreated = $false
+$workDirectoryRemovalAttempted = $false
+$taskName = ''
+$taskRegistered = $false
+$openSshMutationStarted = $false
+$keyRewriteAttempted = $false
+$configBackupRemovalAttempted = $false
+$winRmServicePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\WinRM'
+$winRmPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+$resetHttpIsolationRuleName = 'Mavi-WinRM-Reset-HTTP-Isolation-TCP'
+$resetHttpsIsolationRuleName = 'Mavi-WinRM-Reset-HTTPS-Isolation-TCP'
+$originalWinRmService = Get-Service -Name WinRM -ErrorAction Stop
+$originalWinRmStatus = [string]$originalWinRmService.Status
+$originalWinRmStartValue = [int](Get-ItemPropertyValue `
+    -LiteralPath $winRmServicePath `
     -Name Start `
     -ErrorAction Stop
 )
-if ($remainingListeners -ne 0 -or [string]$service.Status -ne 'Stopped' -or $serviceStartValue -ne 4) {
-    throw 'Mavi WinRM Reset: Der abschließende Stand-0-Nachweis ist fehlgeschlagen.'
+$originalWinRmDelayedAutoStart = 0
+$originalWinRmDelayedAutoStartExists = $false
+try {
+    $originalWinRmDelayedAutoStart = [int](Get-ItemPropertyValue `
+        -LiteralPath $winRmServicePath `
+        -Name DelayedAutoStart `
+        -ErrorAction Stop
+    )
+    $originalWinRmDelayedAutoStartExists = $true
+}
+catch {
+    $originalWinRmDelayedAutoStart = 0
+    $originalWinRmDelayedAutoStartExists = $false
 }
 
+$originalAllowNegotiateExists = $false
+$originalAllowNegotiate = 0
+if (Test-Path -LiteralPath $winRmPolicyPath) {
+    $originalWinRmPolicy = Get-ItemProperty `
+        -LiteralPath $winRmPolicyPath `
+        -ErrorAction Stop
+    $originalAllowNegotiateProperty = $originalWinRmPolicy.PSObject.Properties[
+        'AllowNegotiate'
+    ]
+    if ($null -ne $originalAllowNegotiateProperty) {
+        $originalAllowNegotiateExists = $true
+        $originalAllowNegotiate = [int]$originalAllowNegotiateProperty.Value
+    }
+}
+
+function Get-MaviResetIsolationRule {
+    param(
+        [string]$Name,
+        [int]$Port
+    )
+
+    $rules = @(Get-NetFirewallRule -Name $Name -ErrorAction SilentlyContinue)
+    if ($rules.Count -gt 1) {
+        throw "Mavi WinRM Reset: Die Wartungs-Firewallregel $Name ist nicht eindeutig."
+    }
+    if ($rules.Count -eq 0) {
+        return $null
+    }
+
+    $rule = $rules[0]
+    $portFilters = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+    $addressFilters = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
+    $localPorts = @($portFilters[0].LocalPort | ForEach-Object { [string]$_ })
+    $remoteAddresses = @($addressFilters[0].RemoteAddress | ForEach-Object { [string]$_ })
+    if (
+        [string]$rule.Group -cne 'Mavi Provisioner' -or
+        [string]$rule.Enabled -ne 'True' -or
+        [string]$rule.Direction -ne 'Inbound' -or
+        [string]$rule.Action -ne 'Block' -or
+        $portFilters.Count -ne 1 -or
+        [string]$portFilters[0].Protocol -ne 'TCP' -or
+        $localPorts.Count -ne 1 -or
+        $localPorts[0] -ne [string]$Port -or
+        $addressFilters.Count -ne 1 -or
+        $remoteAddresses.Count -ne 1 -or
+        $remoteAddresses[0] -ne 'Any'
+    ) {
+        throw "Mavi WinRM Reset: Die reservierte Wartungs-Firewallregel $Name kollidiert mit einer unerwarteten Regel."
+    }
+    return $rule
+}
+
+function Enable-MaviResetIsolationRule {
+    param(
+        [string]$Name,
+        [int]$Port
+    )
+
+    $rule = Get-MaviResetIsolationRule -Name $Name -Port $Port
+    if ($null -eq $rule) {
+        New-NetFirewallRule `
+            -Name $Name `
+            -DisplayName $Name `
+            -Group 'Mavi Provisioner' `
+            -Enabled True `
+            -Direction Inbound `
+            -Action Block `
+            -Profile Any `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -RemoteAddress Any `
+            -EdgeTraversalPolicy Block `
+            -ErrorAction Stop | Out-Null
+    }
+    [void](Get-MaviResetIsolationRule -Name $Name -Port $Port)
+}
+
+function Remove-MaviResetIsolationRules {
+    foreach ($isolationRule in @(
+        @{ Name = $resetHttpIsolationRuleName; Port = 5985 },
+        @{ Name = $resetHttpsIsolationRuleName; Port = 5986 }
+    )) {
+        $rule = Get-MaviResetIsolationRule `
+            -Name $isolationRule.Name `
+            -Port $isolationRule.Port
+        if ($null -ne $rule) {
+            Remove-NetFirewallRule -InputObject $rule -ErrorAction Stop
+        }
+    }
+}
+
+function Restore-MaviAllowNegotiatePolicy {
+    if ($originalAllowNegotiateExists) {
+        New-Item -Path $winRmPolicyPath -Force -ErrorAction Stop | Out-Null
+        Set-ItemProperty `
+            -LiteralPath $winRmPolicyPath `
+            -Name AllowNegotiate `
+            -Type DWord `
+            -Value $originalAllowNegotiate `
+            -Force `
+            -ErrorAction Stop
+    }
+    elseif (Test-Path -LiteralPath $winRmPolicyPath) {
+        $currentPolicy = Get-ItemProperty `
+            -LiteralPath $winRmPolicyPath `
+            -ErrorAction Stop
+        if ($null -ne $currentPolicy.PSObject.Properties['AllowNegotiate']) {
+            Remove-ItemProperty `
+                -LiteralPath $winRmPolicyPath `
+                -Name AllowNegotiate `
+                -ErrorAction Stop
+        }
+    }
+
+    $restoredAllowNegotiateProperty = $null
+    if (Test-Path -LiteralPath $winRmPolicyPath) {
+        $restoredPolicy = Get-ItemProperty `
+            -LiteralPath $winRmPolicyPath `
+            -ErrorAction Stop
+        $restoredAllowNegotiateProperty = $restoredPolicy.PSObject.Properties[
+            'AllowNegotiate'
+        ]
+    }
+    if (
+        ($originalAllowNegotiateExists -and (
+            $null -eq $restoredAllowNegotiateProperty -or
+            [int]$restoredAllowNegotiateProperty.Value -ne $originalAllowNegotiate
+        )) -or
+        (-not $originalAllowNegotiateExists -and $null -ne $restoredAllowNegotiateProperty)
+    ) {
+        throw 'Mavi WinRM Reset: Die ursprüngliche AllowNegotiate-Richtlinie wurde nicht exakt wiederhergestellt.'
+    }
+}
+
+function Enable-MaviWinRmProviderMaintenance {
+    # Block-Regeln haben Vorrang vor allen Allow-Regeln. Erst wenn sowohl HTTP
+    # als auch HTTPS von außen isoliert sind, darf Negotiate kurzzeitig für den
+    # ausschließlich lokalen WSMan:-Provider wieder aktiviert werden.
+    Enable-MaviResetIsolationRule -Name $resetHttpIsolationRuleName -Port 5985
+    Enable-MaviResetIsolationRule -Name $resetHttpsIsolationRuleName -Port 5986
+    New-Item -Path $winRmPolicyPath -Force -ErrorAction Stop | Out-Null
+    Set-ItemProperty `
+        -LiteralPath $winRmPolicyPath `
+        -Name AllowNegotiate `
+        -Type DWord `
+        -Value 1 `
+        -Force `
+        -ErrorAction Stop
+    Set-Service -Name WinRM -StartupType Manual -ErrorAction Stop
+    Restart-Service -Name WinRM -Force -ErrorAction Stop
+
+    $providerDeadline = (Get-Date).AddSeconds(20)
+    do {
+        try {
+            [void]@(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
+            return
+        }
+        catch {
+            $providerError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $providerDeadline)
+    throw "Mavi WinRM Reset: Der lokal isolierte WSMan-Provider wurde nicht bereit: $providerError"
+}
+
+function Restore-MaviWinRmServiceState {
+    param(
+        [string]$OriginalStatus,
+        [int]$OriginalStartValue,
+        [int]$OriginalDelayedAutoStart,
+        [bool]$OriginalDelayedAutoStartExists
+    )
+
+    $startupType = switch ($OriginalStartValue) {
+        2 { 'Automatic' }
+        3 { 'Manual' }
+        4 { 'Disabled' }
+        default { throw "Mavi WinRM Reset: Unbekannter ursprünglicher WinRM-Startwert: $OriginalStartValue" }
+    }
+
+    # Ein deaktivierter Dienst kann nicht direkt gestartet werden. Deshalb
+    # zunächst Manual, den Laufzustand wiederherstellen und erst dann den
+    # ursprünglichen Starttyp setzen.
+    Set-Service -Name WinRM -StartupType Manual -ErrorAction Stop
+    if ($OriginalStatus -eq 'Running') {
+        Start-Service -Name WinRM -ErrorAction Stop
+        (Get-Service -Name WinRM -ErrorAction Stop).WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(20)
+        )
+    }
+    else {
+        Stop-Service -Name WinRM -Force -ErrorAction SilentlyContinue
+        (Get-Service -Name WinRM -ErrorAction Stop).WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+            [TimeSpan]::FromSeconds(20)
+        )
+    }
+    Set-Service -Name WinRM -StartupType $startupType -ErrorAction Stop
+    if ($OriginalStartValue -eq 2) {
+        if ($OriginalDelayedAutoStartExists) {
+            Set-ItemProperty `
+                -LiteralPath $winRmServicePath `
+                -Name DelayedAutoStart `
+                -Value $OriginalDelayedAutoStart `
+                -ErrorAction Stop
+        }
+        else {
+            Remove-ItemProperty `
+                -LiteralPath $winRmServicePath `
+                -Name DelayedAutoStart `
+                -ErrorAction SilentlyContinue
+        }
+    }
+
+    $restoredService = Get-Service -Name WinRM -ErrorAction Stop
+    $restoredStartValue = [int](Get-ItemPropertyValue `
+        -LiteralPath $winRmServicePath `
+        -Name Start `
+        -ErrorAction Stop
+    )
+    if (
+        [string]$restoredService.Status -ne $OriginalStatus -or
+        $restoredStartValue -ne $OriginalStartValue
+    ) {
+        throw 'Mavi WinRM Reset: Der ursprüngliche WinRM-Dienstzustand konnte nicht vollständig wiederhergestellt werden.'
+    }
+}
+
+$RootCertificateDerBase64 = $RootCertificateDerBase64.Trim()
+$effectiveRootThumbprint = $RootThumbprint
+$expectedRootCertificate = $null
+$controllerRootDerBase64 = ''
+if (
+    -not [string]::IsNullOrWhiteSpace($effectiveRootThumbprint) -and
+    [string]::IsNullOrWhiteSpace($RootCertificateDerBase64)
+) {
+    throw 'Mavi WinRM Reset: Ein Inventory-Thumbprint ohne controllerseitiges Root-DER ist keine Löschberechtigung.'
+}
+
+function New-MaviCertificateRollbackSnapshot {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+
+    $providerPath = [string]$Certificate.PSPath
+    if ($providerPath -notmatch 'Certificate::LocalMachine\\(?<StoreName>[^\\]+)\\[A-Fa-f0-9]{40}$') {
+        throw "Mavi WinRM Reset: Zertifikatspfad kann nicht rollback-sicher abgebildet werden: $providerPath"
+    }
+    return [PSCustomObject]@{
+        Certificate = $Certificate
+        ProviderPath = $providerPath
+        StoreName = [string]$Matches['StoreName']
+        Thumbprint = (([string]$Certificate.Thumbprint) -replace '\s', '').ToUpperInvariant()
+        HadPrivateKey = [bool]$Certificate.HasPrivateKey
+        MutationAttempted = $false
+    }
+}
+
+function Restore-MaviWinRmArtifacts {
+    # Der Provider benoetigt einen laufenden Dienst, bevor Zertifikate und
+    # Listener wieder an ihren exakten urspruenglichen Platz gesetzt werden.
+    Set-Service -Name WinRM -StartupType Manual -ErrorAction Stop
+    Start-Service -Name WinRM -ErrorAction Stop
+
+    foreach ($snapshot in @($winRmCertificateSnapshots | Where-Object MutationAttempted)) {
+        $certificatePath = "Cert:\LocalMachine\$($snapshot.StoreName)\$($snapshot.Thumbprint)"
+        $currentCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction SilentlyContinue
+        if ($null -eq $currentCertificate) {
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                [string]$snapshot.StoreName,
+                [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+            )
+            try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                # Das Zertifikat wurde in der Mutationsphase bewusst ohne
+                # -DeleteKey entfernt. Das gehaltene X509Certificate2-Objekt
+                # traegt dadurch weiterhin die Bindung zum nicht exportierbaren
+                # Mavi-Schluessel und kann sie im Rollback exakt restaurieren.
+                $store.Add($snapshot.Certificate)
+            }
+            finally {
+                $store.Close()
+            }
+            $currentCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
+        }
+        if (
+            $snapshot.HadPrivateKey -and
+            -not [bool]$currentCertificate.HasPrivateKey
+        ) {
+            throw "Mavi WinRM Reset: Der private Schluessel von $($snapshot.Thumbprint) wurde beim Rollback nicht wieder angebunden."
+        }
+    }
+
+    foreach ($snapshot in @($winRmFirewallSnapshots | Where-Object MutationAttempted)) {
+        $currentRules = @(
+            Get-NetFirewallRule -Name $snapshot.Name -ErrorAction SilentlyContinue
+        )
+        if ($currentRules.Count -gt 1) {
+            throw "Mavi WinRM Reset: Firewallregel $($snapshot.Name) ist beim Rollback nicht eindeutig."
+        }
+        if ($currentRules.Count -eq 1) {
+            Remove-NetFirewallRule -InputObject $currentRules[0] -ErrorAction Stop
+        }
+        New-NetFirewallRule `
+            -Name $snapshot.Name `
+            -DisplayName $snapshot.DisplayName `
+            -Group $snapshot.Group `
+            -Enabled $snapshot.Enabled `
+            -Direction $snapshot.Direction `
+            -Action $snapshot.Action `
+            -Profile $snapshot.Profile `
+            -Protocol $snapshot.Protocol `
+            -LocalPort $snapshot.LocalPort `
+            -RemotePort $snapshot.RemotePort `
+            -LocalAddress $snapshot.LocalAddress `
+            -RemoteAddress $snapshot.RemoteAddress `
+            -EdgeTraversalPolicy $snapshot.EdgeTraversalPolicy `
+            -ErrorAction Stop | Out-Null
+    }
+
+    foreach ($snapshot in @($winRmListenerSnapshots | Where-Object MutationAttempted)) {
+        $matchingListeners = @(
+            Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop |
+            Where-Object {
+                $_.Keys -contains "Transport=$($snapshot.Transport)" -and
+                $_.Keys -contains "Address=$($snapshot.Address)"
+            }
+        )
+        if ($matchingListeners.Count -eq 0) {
+            New-WSManInstance `
+                -ResourceURI 'winrm/config/Listener' `
+                -SelectorSet @{
+                    Transport = $snapshot.Transport
+                    Address = $snapshot.Address
+                } `
+                -ValueSet @{
+                    Hostname = $snapshot.Hostname
+                    CertificateThumbprint = $snapshot.CertificateThumbprint
+                } `
+                -ErrorAction Stop | Out-Null
+        }
+        elseif ($matchingListeners.Count -ne 1) {
+            throw 'Mavi WinRM Reset: Ein Listener ist beim Rollback nicht eindeutig.'
+        }
+        else {
+            $restoredListenerValues = @{}
+            foreach ($listenerValue in @(
+                Get-ChildItem -LiteralPath $matchingListeners[0].PSPath -ErrorAction Stop
+            )) {
+                $restoredListenerValues[[string]$listenerValue.Name] = [string]$listenerValue.Value
+            }
+            $restoredThumbprint = (
+                ([string]$restoredListenerValues['CertificateThumbprint']) -replace '\s', ''
+            ).ToUpperInvariant()
+            if (
+                [string]$restoredListenerValues['Hostname'] -cne $snapshot.Hostname -or
+                $restoredThumbprint -cne $snapshot.CertificateThumbprint
+            ) {
+                throw 'Mavi WinRM Reset: Der Listener weicht nach dem Rollback vom Snapshot ab.'
+            }
+        }
+    }
+
+    if ($workDirectorySnapshotCreated -and $workDirectoryRemovalAttempted) {
+        if (Test-Path -LiteralPath $workDirectory) {
+            Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction Stop
+        }
+        New-Item -ItemType Directory -Path $workDirectory -Force -ErrorAction Stop | Out-Null
+        foreach ($relativeDirectory in @($workDirectoryDirectories | Sort-Object Length)) {
+            New-Item `
+                -ItemType Directory `
+                -Path (Join-Path $workDirectory $relativeDirectory) `
+                -Force `
+                -ErrorAction Stop | Out-Null
+        }
+        foreach ($fileSnapshot in $workDirectoryFileSnapshots) {
+            $restoredFile = Join-Path $workDirectory $fileSnapshot.RelativePath
+            $restoredParent = Split-Path -Parent $restoredFile
+            New-Item -ItemType Directory -Path $restoredParent -Force -ErrorAction Stop | Out-Null
+            [System.IO.File]::WriteAllBytes($restoredFile, $fileSnapshot.Bytes)
+        }
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($RootCertificateDerBase64)) {
+    try {
+        $controllerRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [Convert]::FromBase64String($RootCertificateDerBase64)
+        )
+    }
+    catch {
+        throw 'Mavi WinRM Reset: Das erwartete Mavi-Root-Zertifikat ist ungültig.'
+    }
+    $controllerRootThumbprint = ([string]$controllerRoot.Thumbprint).ToUpperInvariant()
+    if (
+        -not [string]::IsNullOrWhiteSpace($RootThumbprint) -and
+        -not $controllerRootThumbprint.Equals(
+            $RootThumbprint,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw 'Mavi WinRM Reset: Root-Zertifikat und Root-CA-Fingerabdruck stimmen nicht überein.'
+    }
+    $effectiveRootThumbprint = $controllerRootThumbprint
+    $expectedRootCertificate = $controllerRoot
+    $controllerRootDerBase64 = [Convert]::ToBase64String($controllerRoot.RawData)
+}
+
+if ($effectiveRootThumbprint -match '^[A-F0-9]{40}$' -and $null -eq $expectedRootCertificate) {
+    throw 'Mavi WinRM Reset: Die exakt erwartete Mavi-Root-CA ist controllerseitig nicht als DER verfügbar; Mavi löscht keine Zertifikate per Inventory-Thumbprint, Namen oder Subject.'
+}
+$winRmScopeVerified = $false
+if ($null -ne $expectedRootCertificate) {
+    $expectedRootThumbprint = ([string]$expectedRootCertificate.Thumbprint).ToUpperInvariant()
+    if ($expectedRootThumbprint -notmatch '^[A-F0-9]{40}$') {
+        throw 'Mavi WinRM Reset: Die erwartete Mavi-Root-CA besitzt keinen gültigen Fingerabdruck.'
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($effectiveRootThumbprint) -and
+        -not $expectedRootThumbprint.Equals($effectiveRootThumbprint, [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        throw 'Mavi WinRM Reset: Die erwartete Mavi-Root-CA stimmt nicht mit ihrem Fingerabdruck überein.'
+    }
+    $effectiveRootThumbprint = $expectedRootThumbprint
+    $winRmScopeVerified = $true
+}
+if ($winRmScopeVerified -and [string]::IsNullOrWhiteSpace($ExpectedFqdn)) {
+    throw 'Mavi WinRM Reset: Der erwartete Ziel-FQDN fehlt; Mavi löscht keine Zertifikate über eine hostübergreifende Namenssuche.'
+}
+
+function Test-MaviLeafForRoot {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot
+    )
+    if (
+        $null -eq $Certificate -or
+        $null -eq $ExpectedRoot
+    ) {
+        return $false
+    }
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.VerificationFlags = (
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority -bor
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+        )
+        [void]$chain.ChainPolicy.ExtraStore.Add($ExpectedRoot)
+        if (-not $chain.Build($Certificate) -or $chain.ChainElements.Count -lt 2) {
+            return $false
+        }
+        $chainRoot = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+        return (
+            ([string]$chainRoot.Thumbprint).Equals(
+                [string]$ExpectedRoot.Thumbprint,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [Convert]::ToBase64String($chainRoot.RawData) -ceq
+                [Convert]::ToBase64String($ExpectedRoot.RawData)
+        )
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
+function Test-MaviLeafCertificate {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot,
+        [string]$ExpectedFqdn
+    )
+    if (
+        [string]::IsNullOrWhiteSpace($ExpectedFqdn) -or
+        -not (Test-MaviLeafForRoot -Certificate $Certificate -ExpectedRoot $ExpectedRoot)
+    ) {
+        return $false
+    }
+    $expectedFriendlyName = "Mavi WinRM HTTPS $ExpectedFqdn"
+    if (-not ([string]$Certificate.FriendlyName).Equals($expectedFriendlyName, [System.StringComparison]::Ordinal)) {
+        return $false
+    }
+    $subjectName = [string]$Certificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+        $false
+    )
+    return $subjectName.Equals($ExpectedFqdn, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-MaviLeafCertificates {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot,
+        [string]$ExpectedFqdn
+    )
+    if ($null -eq $ExpectedRoot -or [string]::IsNullOrWhiteSpace($ExpectedFqdn)) {
+        return @()
+    }
+    $matchedCertificates = @()
+    foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
+        if (-not (Test-Path -LiteralPath $storePath)) { continue }
+        foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction SilentlyContinue)) {
+            if (Test-MaviLeafCertificate -Certificate $certificate -ExpectedRoot $ExpectedRoot -ExpectedFqdn $ExpectedFqdn) {
+                $matchedCertificates += $certificate
+            }
+        }
+    }
+    return @($matchedCertificates)
+}
+
+function Get-MaviLeavesForRoot {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot)
+    if ($null -eq $ExpectedRoot) {
+        return @()
+    }
+    $matchedLeaves = @()
+    foreach ($storePath in @('Cert:\LocalMachine\My', 'Cert:\LocalMachine\Request')) {
+        if (-not (Test-Path -LiteralPath $storePath)) { continue }
+        foreach ($certificate in @(Get-ChildItem -LiteralPath $storePath -ErrorAction SilentlyContinue)) {
+            if (Test-MaviLeafForRoot -Certificate $certificate -ExpectedRoot $ExpectedRoot) {
+                $matchedLeaves += $certificate
+            }
+        }
+    }
+    return @($matchedLeaves)
+}
+
+function Get-MaviWinRmListeners {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ExpectedRoot,
+        [string]$ExpectedFqdn,
+        [bool]$AnyMaviLeafForRoot = $false
+    )
+    # Nicht $matches verwenden: PowerShell reserviert $Matches (ohne
+    # Beachtung der Gross-/Kleinschreibung) fuer das Ergebnis von -match.
+    $matchedListeners = @()
+    if (
+        $null -eq $ExpectedRoot -or
+        (-not $AnyMaviLeafForRoot -and [string]::IsNullOrWhiteSpace($ExpectedFqdn))
+    ) {
+        return @()
+    }
+    foreach ($listener in @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)) {
+        if ($listener.Keys -notcontains 'Transport=HTTPS') {
+            continue
+        }
+        $listenerValues = @{}
+        foreach ($listenerValue in @(Get-ChildItem -LiteralPath $listener.PSPath -ErrorAction Stop)) {
+            $listenerValueName = [string]$listenerValue.Name
+            if (-not [string]::IsNullOrWhiteSpace($listenerValueName)) {
+                $listenerValues[$listenerValueName] = [string]$listenerValue.Value
+            }
+        }
+        $listenerThumbprint = (([string]$listenerValues['CertificateThumbprint']).Trim() -replace '\s', '').ToUpperInvariant()
+        if ($listenerThumbprint -notmatch '^[A-F0-9]{40}$') {
+            continue
+        }
+        $listenerCertificate = Get-Item -LiteralPath ("Cert:\LocalMachine\My\$listenerThumbprint") -ErrorAction SilentlyContinue
+        $matchesExpectedScope = if ($AnyMaviLeafForRoot) {
+            Test-MaviLeafForRoot -Certificate $listenerCertificate -ExpectedRoot $ExpectedRoot
+        }
+        else {
+            Test-MaviLeafCertificate -Certificate $listenerCertificate -ExpectedRoot $ExpectedRoot -ExpectedFqdn $ExpectedFqdn
+        }
+        if ($matchesExpectedScope) {
+            $matchedListeners += $listener
+        }
+    }
+    return @($matchedListeners)
+}
+
+try {
 if ($disableOpenSsh) {
+    # Vollstaendig falliblen OpenSSH-Preflight und die Task-Registrierung vor
+    # der ersten destruktiven WinRM-Aenderung abschliessen. Der Task wird erst
+    # nach erfolgreichem WinRM-Cleanup gestartet; bis dahin ist er inert und
+    # wird vom aeusseren Rollback wieder entfernt.
+    $sshdServicePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd'
     $sshdService = Get-Service -Name sshd -ErrorAction SilentlyContinue
     if ($null -eq $sshdService) {
         throw 'Mavi Remote-Aus: Der OpenSSH-Serverdienst sshd wurde nicht gefunden.'
     }
+    $originalSshdStatus = [string]$sshdService.Status
+    if ($originalSshdStatus -notin @('Running', 'Stopped')) {
+        throw "Mavi Remote-Aus: Der urspruengliche sshd-Zustand ist nicht stabil: $originalSshdStatus"
+    }
+    $originalSshdStartValue = [int](Get-ItemPropertyValue `
+        -LiteralPath $sshdServicePath `
+        -Name Start `
+        -ErrorAction Stop
+    )
+    if ($originalSshdStartValue -notin @(2, 3, 4)) {
+        throw "Mavi Remote-Aus: Der urspruengliche sshd-Startwert ist unbekannt: $originalSshdStartValue"
+    }
+    $originalSshdDelayedAutoStart = 0
+    $originalSshdDelayedAutoStartExists = $false
+    try {
+        $originalSshdDelayedAutoStart = [int](Get-ItemPropertyValue `
+            -LiteralPath $sshdServicePath `
+            -Name DelayedAutoStart `
+            -ErrorAction Stop
+        )
+        $originalSshdDelayedAutoStartExists = $true
+    }
+    catch {
+        $originalSshdDelayedAutoStart = 0
+        $originalSshdDelayedAutoStartExists = $false
+    }
 
-    # Der laufende SSH-Kanal darf seine Erfolgsmeldung noch zurückgeben. Der
-    # Dienst wird bereits jetzt für jeden Neustart deaktiviert und wenige
-    # Sekunden später durch einen einmaligen SYSTEM-Task gestoppt.
-    Set-Service -Name sshd -StartupType Disabled -ErrorAction Stop
+    function Restore-MaviSshdServiceState {
+        param(
+            [string]$OriginalStatus,
+            [int]$OriginalStartValue,
+            [int]$OriginalDelayedAutoStart,
+            [bool]$OriginalDelayedAutoStartExists,
+            [string]$ServicePath
+        )
+
+        $startupType = switch ($OriginalStartValue) {
+            2 { 'Automatic' }
+            3 { 'Manual' }
+            4 { 'Disabled' }
+            default { throw "Mavi Remote-Aus: Unbekannter urspruenglicher sshd-Startwert: $OriginalStartValue" }
+        }
+        Set-Service -Name sshd -StartupType Manual -ErrorAction Stop
+        if ($OriginalStatus -eq 'Running') {
+            Start-Service -Name sshd -ErrorAction Stop
+            (Get-Service -Name sshd -ErrorAction Stop).WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Running,
+                [TimeSpan]::FromSeconds(20)
+            )
+        }
+        else {
+            Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+            (Get-Service -Name sshd -ErrorAction Stop).WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                [TimeSpan]::FromSeconds(20)
+            )
+        }
+        Set-Service -Name sshd -StartupType $startupType -ErrorAction Stop
+        if ($OriginalDelayedAutoStartExists) {
+            Set-ItemProperty `
+                -LiteralPath $ServicePath `
+                -Name DelayedAutoStart `
+                -Value $OriginalDelayedAutoStart `
+                -ErrorAction Stop
+        }
+        else {
+            Remove-ItemProperty `
+                -LiteralPath $ServicePath `
+                -Name DelayedAutoStart `
+                -ErrorAction SilentlyContinue
+        }
+
+        $restoredService = Get-Service -Name sshd -ErrorAction Stop
+        $restoredStartValue = [int](Get-ItemPropertyValue `
+            -LiteralPath $ServicePath `
+            -Name Start `
+            -ErrorAction Stop
+        )
+        if (
+            [string]$restoredService.Status -ne $OriginalStatus -or
+            $restoredStartValue -ne $OriginalStartValue
+        ) {
+            throw 'Mavi Remote-Aus: Der urspruengliche sshd-Dienstzustand wurde nicht vollstaendig wiederhergestellt.'
+        }
+    }
 
     $keyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    if (Test-Path -LiteralPath $keyFile -PathType Leaf) {
-        $keyLines = @(Get-Content -LiteralPath $keyFile -ErrorAction Stop)
-        $keptKeyLines = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($keyLineObject in $keyLines) {
-            $keyLine = [string]$keyLineObject
-            $trimmedKeyLine = $keyLine.Trim()
-            $isMaviKey = $false
-            if (-not [string]::IsNullOrWhiteSpace($CurrentKeyMarker)) {
-                $markerPattern = '(^|\s)' + [regex]::Escape($CurrentKeyMarker) + '(\s|$)'
-                $isMaviKey = $trimmedKeyLine -match $markerPattern
-            }
-            if (
-                -not $isMaviKey -and
-                -not [string]::IsNullOrWhiteSpace($CurrentKeyPrefix) -and
-                ($trimmedKeyLine -eq $CurrentKeyPrefix -or $trimmedKeyLine.StartsWith($CurrentKeyPrefix + ' '))
-            ) {
-                $isMaviKey = $true
-            }
-            if ($isMaviKey) {
-                $removedOpenSshKeys++
-                continue
-            }
-            $keptKeyLines.Add($keyLine)
+    $originalKeyFileExists = Test-Path -LiteralPath $keyFile -PathType Leaf
+    [byte[]]$originalKeyFileBytes = @()
+    if ($originalKeyFileExists) {
+        $originalKeyFileBytes = [System.IO.File]::ReadAllBytes($keyFile)
+    }
+
+    $openSshConfigBackup = Join-Path $env:ProgramData $OpenSshConfigBackupPath
+    $originalOpenSshConfigBackupExists = Test-Path -LiteralPath $openSshConfigBackup -PathType Leaf
+    [byte[]]$originalOpenSshConfigBackupBytes = @()
+    if ($originalOpenSshConfigBackupExists) {
+        $originalOpenSshConfigBackupBytes = [System.IO.File]::ReadAllBytes($openSshConfigBackup)
+    }
+
+    $openSshRules = @(Get-NetFirewallRule -Name $OpenSshFirewallRuleName -ErrorAction SilentlyContinue)
+    if ($openSshRules.Count -gt 1) {
+        throw 'Mavi Remote-Aus: Die Mavi-OpenSSH-Firewallregel ist nicht eindeutig.'
+    }
+    $originalOpenSshFirewallRuleExists = ($openSshRules.Count -eq 1)
+    $originalOpenSshFirewallRuleEnabledValue = 'False'
+    $originalOpenSshFirewallDisplayName = ''
+    $originalOpenSshFirewallRemoteAddresses = @()
+    if ($originalOpenSshFirewallRuleExists) {
+        $originalOpenSshFirewallDisplayName = [string]$openSshRules[0].DisplayName
+        $originalOpenSshFirewallRuleEnabledValue = if ([string]$openSshRules[0].Enabled -eq 'True') {
+            'True'
         }
-        if ($removedOpenSshKeys -gt 0) {
-            [System.IO.File]::WriteAllLines(
-                $keyFile,
-                [string[]]$keptKeyLines,
-                [System.Text.Encoding]::ASCII
-            )
+        else {
+            'False'
+        }
+        $addressFilters = @($openSshRules[0] | Get-NetFirewallAddressFilter -ErrorAction Stop)
+        if ($addressFilters.Count -ne 1) {
+            throw 'Mavi Remote-Aus: Die Mavi-OpenSSH-Firewallregel besitzt keinen eindeutigen Adressfilter.'
+        }
+        $originalOpenSshFirewallRemoteAddresses = @(
+            $addressFilters[0].RemoteAddress |
+            ForEach-Object { [string]$_ }
+        )
+        if ($originalOpenSshFirewallRemoteAddresses.Count -eq 0) {
+            throw 'Mavi Remote-Aus: Die Mavi-OpenSSH-Firewallregel besitzt keinen wiederherstellbaren Remote-Scope.'
         }
     }
 
     $taskName = 'Mavi-Disable-RemoteAccess-' + [Guid]::NewGuid().ToString('N')
     $childScript = @'
-$ErrorActionPreference = 'SilentlyContinue'
-Start-Sleep -Seconds 20
-Get-NetFirewallRule -Name '__MAVI_FIREWALL_RULE_NAME__' -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction SilentlyContinue
-Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
-Set-Service -Name sshd -StartupType Disabled -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName '__MAVI_TASK_NAME__' -Confirm:$false -ErrorAction SilentlyContinue
+$ErrorActionPreference = 'Stop'
+Start-Sleep -Seconds 2
+Set-Service -Name sshd -StartupType Disabled -ErrorAction Stop
+Stop-Service -Name sshd -Force -ErrorAction Stop
+(Get-Service -Name sshd -ErrorAction Stop).WaitForStatus(
+    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+    [TimeSpan]::FromSeconds(20)
+)
+$finalStartValue = [int](Get-ItemPropertyValue `
+    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd' `
+    -Name Start `
+    -ErrorAction Stop
+)
+if ([string](Get-Service -Name sshd -ErrorAction Stop).Status -ne 'Stopped' -or $finalStartValue -ne 4) {
+    throw 'Mavi Remote-Aus: Der SYSTEM-Task konnte sshd nicht gestoppt und deaktiviert bestaetigen.'
+}
 '@
-    $childScript = $childScript.Replace('__MAVI_TASK_NAME__', $taskName)
-    $childScript = $childScript.Replace('__MAVI_FIREWALL_RULE_NAME__', $OpenSshFirewallRuleName)
     $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
     $taskAction = New-ScheduledTaskAction `
         -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
@@ -2792,34 +4383,774 @@ Unregister-ScheduledTask -TaskName '__MAVI_TASK_NAME__' -Confirm:$false -ErrorAc
         -Action $taskAction `
         -Principal $taskPrincipal `
         -Settings $taskSettings `
-        -Force | Out-Null
+        -Force `
+        -ErrorAction Stop | Out-Null
+    $taskRegistered = $true
     $beforeTaskRun = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop).LastRunTime
-    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-    $taskStartDeadline = (Get-Date).AddSeconds(6)
-    do {
-        Start-Sleep -Milliseconds 250
-        $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-        $scheduledTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop
-        if ($scheduledTask.State -eq 'Running' -or $scheduledTaskInfo.LastRunTime -gt $beforeTaskRun) {
-            $openSshDisableScheduled = $true
-            break
-        }
-    } while ((Get-Date) -lt $taskStartDeadline)
-    if (-not $openSshDisableScheduled) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        throw 'Mavi Remote-Aus: Der verzögerte sshd-Stopp konnte nicht gestartet werden.'
-    }
 }
 
-$Ansible.Result = @{
+try {
+    # Der gehärtete Endzustand AllowNegotiate=0 sperrt auch den lokalen
+    # WSMan:-Provider aus. Der Wartungsmodus öffnet ihn erst, nachdem beide
+    # WinRM-Netzwerkports durch höher priorisierte Block-Regeln isoliert sind.
+    $winRmMaintenanceAttempted = $true
+    Enable-MaviWinRmProviderMaintenance
+
+    if ($disableOpenSsh) {
+        # Den vollständigen Rückbau vor der ersten Löschung freigeben. Wenn
+        # fremde Listener vorhanden sind, bleibt auch der Mavi-Listener stehen.
+        $preflightWinRmListeners = @(
+            Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop
+        )
+        $preflightMaviWinRmListeners = @()
+        if ($winRmScopeVerified) {
+            $preflightMaviWinRmListeners = @(
+                Get-MaviWinRmListeners `
+                    -ExpectedRoot $expectedRootCertificate `
+                    -ExpectedFqdn $ExpectedFqdn `
+                    -AnyMaviLeafForRoot $disableOpenSsh
+            )
+        }
+        if (-not $winRmScopeVerified) {
+            throw 'Mavi Remote-Aus: Der WinRM-Zertifikats-Scope konnte ohne exakte Root-Identität nicht verifiziert werden; ein leerer Listener-Bestand reicht nicht aus.'
+        }
+        if ($preflightWinRmListeners.Count -ne $preflightMaviWinRmListeners.Count) {
+            throw 'Mavi Remote-Aus: Fremde WinRM-Listener verhindern den vollständigen Rückbau; es wurde noch kein Listener entfernt.'
+        }
+    }
+
+    # Alle Zielobjekte und ihre rollback-relevanten Eigenschaften werden vor
+    # der ersten Loeschung vollstaendig gelesen. Damit kann weder ein spaeter
+    # fehlschlagender Firewall-/Store-Zugriff noch die OpenSSH-Finalisierung
+    # einen bereits funktionierenden HTTPS-Endpunkt dauerhaft halb entfernen.
+    $listenersToRemove = @()
+    if ($winRmScopeVerified) {
+        $listenersToRemove = @(
+            Get-MaviWinRmListeners `
+                -ExpectedRoot $expectedRootCertificate `
+                -ExpectedFqdn $ExpectedFqdn `
+                -AnyMaviLeafForRoot $disableOpenSsh
+        )
+    }
+    foreach ($listener in $listenersToRemove) {
+        $listenerValues = @{}
+        foreach ($listenerValue in @(Get-ChildItem -LiteralPath $listener.PSPath -ErrorAction Stop)) {
+            $listenerValues[[string]$listenerValue.Name] = [string]$listenerValue.Value
+        }
+        $addressKeys = @($listener.Keys | Where-Object { $_ -like 'Address=*' })
+        if ($addressKeys.Count -ne 1) {
+            throw 'Mavi WinRM Reset: Die Listener-Adresse kann nicht eindeutig gesichert werden.'
+        }
+        $listenerThumbprint = (([string]$listenerValues['CertificateThumbprint']) -replace '\s', '').ToUpperInvariant()
+        if ($listenerThumbprint -notmatch '^[A-F0-9]{40}$') {
+            throw 'Mavi WinRM Reset: Der Listener-Fingerabdruck kann nicht rollback-sicher gesichert werden.'
+        }
+        $winRmListenerSnapshots += [PSCustomObject]@{
+            ProviderPath = [string]$listener.PSPath
+            Transport = 'HTTPS'
+            Address = ([string]$addressKeys[0]).Substring('Address='.Length)
+            Hostname = [string]$listenerValues['Hostname']
+            CertificateThumbprint = $listenerThumbprint
+            MutationAttempted = $false
+        }
+    }
+
+    $firewallRulesToRemove = @()
+    foreach ($name in $firewallNames) {
+        $firewallRulesToRemove += @(
+            Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |
+            Where-Object { [string]$_.Group -eq 'Mavi Provisioner' }
+        )
+    }
+    foreach ($rule in $firewallRulesToRemove) {
+        $portFilters = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+        $addressFilters = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
+        if ($portFilters.Count -ne 1 -or $addressFilters.Count -ne 1) {
+            throw "Mavi WinRM Reset: Firewallregel $($rule.DisplayName) besitzt keinen eindeutigen rollback-faehigen Filter."
+        }
+        $winRmFirewallSnapshots += [PSCustomObject]@{
+            Name = [string]$rule.Name
+            DisplayName = [string]$rule.DisplayName
+            Group = [string]$rule.Group
+            Enabled = [string]$rule.Enabled
+            Direction = [string]$rule.Direction
+            Action = [string]$rule.Action
+            Profile = [string]$rule.Profile
+            EdgeTraversalPolicy = [string]$rule.EdgeTraversalPolicy
+            Protocol = [string]$portFilters[0].Protocol
+            LocalPort = @($portFilters[0].LocalPort | ForEach-Object { [string]$_ })
+            RemotePort = @($portFilters[0].RemotePort | ForEach-Object { [string]$_ })
+            LocalAddress = @($addressFilters[0].LocalAddress | ForEach-Object { [string]$_ })
+            RemoteAddress = @($addressFilters[0].RemoteAddress | ForEach-Object { [string]$_ })
+            MutationAttempted = $false
+        }
+    }
+
+    $certificatesToRemove = @()
+    if ($winRmScopeVerified) {
+        $certificatesToRemove = if ($disableOpenSsh) {
+            @(Get-MaviLeavesForRoot -ExpectedRoot $expectedRootCertificate)
+        }
+        else {
+            @(
+                Get-MaviLeafCertificates `
+                    -ExpectedRoot $expectedRootCertificate `
+                    -ExpectedFqdn $ExpectedFqdn
+            )
+        }
+        foreach ($certificate in $certificatesToRemove) {
+            $winRmCertificateSnapshots += New-MaviCertificateRollbackSnapshot `
+                -Certificate $certificate
+        }
+    }
+
+    $installedRootCertificate = $null
+    $rootPath = ''
+    if ($winRmScopeVerified -and $effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
+        $rootPath = "Cert:\LocalMachine\Root\$effectiveRootThumbprint"
+        $installedRootCertificate = Get-Item -LiteralPath $rootPath -ErrorAction SilentlyContinue
+        if ($null -ne $installedRootCertificate) {
+            $installedRootThumbprint = (
+                ([string]$installedRootCertificate.Thumbprint) -replace '\s', ''
+            ).ToUpperInvariant()
+            $installedRootDerBase64 = [Convert]::ToBase64String(
+                $installedRootCertificate.RawData
+            )
+            if (
+                -not $installedRootThumbprint.Equals(
+                    $effectiveRootThumbprint,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -or
+                $installedRootDerBase64 -cne $controllerRootDerBase64
+            ) {
+                throw 'Mavi WinRM Reset: Die WinRM-Root im Root Store stimmt nicht bytegenau mit dem Controller-DER überein.'
+            }
+            $winRmCertificateSnapshots += New-MaviCertificateRollbackSnapshot `
+                -Certificate $installedRootCertificate
+        }
+    }
+
+    $bootstrapCertificatesToRemove = @()
+    if ($disableOpenSsh) {
+        foreach ($bootstrapRootThumbprint in $BootstrapRootThumbprints) {
+            $bootstrapRootPath = "Cert:\LocalMachine\Root\$bootstrapRootThumbprint"
+            $bootstrapRootCertificate = Get-Item -LiteralPath $bootstrapRootPath -ErrorAction SilentlyContinue
+            if ($null -eq $bootstrapRootCertificate) {
+                continue
+            }
+            $actualBootstrapThumbprint = (
+                ([string]$bootstrapRootCertificate.Thumbprint) -replace '\s', ''
+            ).ToUpperInvariant()
+            $actualBootstrapDerBase64 = [Convert]::ToBase64String(
+                $bootstrapRootCertificate.RawData
+            )
+            if (
+                -not $actualBootstrapThumbprint.Equals(
+                    $bootstrapRootThumbprint,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -or
+                $actualBootstrapDerBase64 -cne [string]$expectedBootstrapRoots[$bootstrapRootThumbprint]
+            ) {
+                throw 'Mavi Remote-Aus: Die Bootstrap-CA im Root Store stimmt nicht bytegenau mit dem Controller-Archiv überein.'
+            }
+            $bootstrapCertificatesToRemove += [PSCustomObject]@{
+                Path = $bootstrapRootPath
+                Thumbprint = $bootstrapRootThumbprint
+                Certificate = $bootstrapRootCertificate
+            }
+            $winRmCertificateSnapshots += New-MaviCertificateRollbackSnapshot `
+                -Certificate $bootstrapRootCertificate
+        }
+    }
+
+    if (Test-Path -LiteralPath $workDirectory) {
+        $workDirectoryItem = Get-Item -LiteralPath $workDirectory -Force -ErrorAction Stop
+        if (-not $workDirectoryItem.PSIsContainer) {
+            throw 'Mavi WinRM Reset: Der erwartete Arbeitsordner ist kein Verzeichnis.'
+        }
+        if (($workDirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Mavi WinRM Reset: Der Arbeitsordner selbst ist ein nicht rollback-fähiger Reparse Point.'
+        }
+        $resolvedWorkDirectory = [System.IO.Path]::GetFullPath($workDirectory).TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar
+        )
+        $resolvedWorkDirectoryPrefix = $resolvedWorkDirectory + [System.IO.Path]::DirectorySeparatorChar
+        foreach ($workItem in @(Get-ChildItem -LiteralPath $workDirectory -Recurse -Force -ErrorAction Stop)) {
+            if (($workItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Mavi WinRM Reset: Der Arbeitsordner enthaelt einen nicht rollback-faehigen Reparse Point.'
+            }
+            $resolvedWorkItem = [System.IO.Path]::GetFullPath($workItem.FullName)
+            if (-not $resolvedWorkItem.StartsWith($resolvedWorkDirectoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Mavi WinRM Reset: Ein Arbeitsordner-Artefakt liegt ausserhalb des erwarteten Pfads.'
+            }
+            $relativeWorkItem = $resolvedWorkItem.Substring($resolvedWorkDirectory.Length + 1)
+            if ($workItem.PSIsContainer) {
+                $workDirectoryDirectories += $relativeWorkItem
+            }
+            else {
+                $workDirectoryFileSnapshots += [PSCustomObject]@{
+                    RelativePath = $relativeWorkItem
+                    Bytes = [System.IO.File]::ReadAllBytes($resolvedWorkItem)
+                }
+            }
+        }
+        $workDirectorySnapshotCreated = $true
+    }
+
+    $winRmMutationStarted = $true
+
+    # Beim Teilrückbau muss das HTTPS-Leaf zusätzlich den erwarteten Mavi-Namen
+    # tragen. Beim Vollrückbau reicht die bytegenaue Kette zur dedizierten
+    # Controller-Root, damit auch historische Mavi-FQDNs vollständig erfasst
+    # werden. HTTP- sowie fremde HTTPS-Listener bleiben unangetastet.
+    if ($winRmScopeVerified) {
+        foreach ($listener in $listenersToRemove) {
+            $listenerSnapshots = @(
+                $winRmListenerSnapshots |
+                Where-Object { $_.ProviderPath -ceq [string]$listener.PSPath }
+            )
+            if ($listenerSnapshots.Count -ne 1) {
+                throw 'Mavi WinRM Reset: Der Listener-Snapshot ist vor der Löschung nicht eindeutig.'
+            }
+            $listenerSnapshots[0].MutationAttempted = $true
+            Remove-Item -LiteralPath $listener.PSPath -Recurse -Force -ErrorAction Stop
+            $removedListeners++
+        }
+        # Den WSMan-Provider nur abfragen, solange WinRM noch laeuft. Ein Zugriff
+        # nach Stop/Disable kann lokal bis zum Ansible-Timeout blockieren.
+        $remainingMaviListeners = @(
+            Get-MaviWinRmListeners `
+                -ExpectedRoot $expectedRootCertificate `
+                -ExpectedFqdn $ExpectedFqdn `
+                -AnyMaviLeafForRoot $disableOpenSsh
+        ).Count
+        if ($remainingMaviListeners -ne 0) {
+            throw 'Mavi WinRM Reset: Ein eindeutig Mavi-verwalteter WinRM-Listener konnte nicht entfernt werden.'
+        }
+    }
+    $preservedWinRmListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop).Count
+    $winRmListenersCleared = ($preservedWinRmListeners -eq 0)
+    if ($disableOpenSsh -and (-not $winRmScopeVerified -or -not $winRmListenersCleared)) {
+        throw 'Mavi Remote-Aus: Ohne exakt verifizierten WinRM-Scope und vollständig leeren Listener-Bestand wird OpenSSH nicht deaktiviert.'
+    }
+
+    foreach ($rule in $firewallRulesToRemove) {
+        $firewallSnapshots = @(
+            $winRmFirewallSnapshots |
+            Where-Object { $_.Name -ceq [string]$rule.Name }
+        )
+        if ($firewallSnapshots.Count -ne 1) {
+            throw "Mavi WinRM Reset: Der Firewall-Snapshot für $($rule.Name) ist nicht eindeutig."
+        }
+        $firewallSnapshots[0].MutationAttempted = $true
+        Remove-NetFirewallRule -InputObject $rule -ErrorAction Stop
+        $removedFirewallRules++
+    }
+
+    if ($winRmScopeVerified) {
+        foreach ($certificate in @($certificatesToRemove)) {
+            # Beim Teilrückbau müssen FriendlyName und Subject den Ziel-FQDN
+            # bezeichnen. Beim Vollrückbau umfasst der Scope alle vom dedizierten
+            # Mavi-WinRM-Root signierten Leaves, damit alte FQDNs oder beschädigte
+            # FriendlyNames nicht als verwaiste Zertifikate zurückbleiben.
+            # Der nicht exportierbare private Schluessel bleibt bis zum
+            # erfolgreichen Commit bestehen, damit der Catch das Leaf samt
+            # funktionierender Listener-Bindung restaurieren kann.
+            $certificateSnapshots = @(
+                $winRmCertificateSnapshots |
+                Where-Object { $_.ProviderPath -ceq [string]$certificate.PSPath }
+            )
+            if ($certificateSnapshots.Count -ne 1) {
+                throw 'Mavi WinRM Reset: Der Leaf-Zertifikatssnapshot ist vor der Löschung nicht eindeutig.'
+            }
+            $certificateSnapshots[0].MutationAttempted = $true
+            Remove-Item -LiteralPath $certificate.PSPath -Force -ErrorAction Stop
+            $removedCertificates++
+        }
+        $remainingMaviCertificates = if ($disableOpenSsh) {
+            @(Get-MaviLeavesForRoot -ExpectedRoot $expectedRootCertificate).Count
+        }
+        else {
+            @(
+                Get-MaviLeafCertificates `
+                    -ExpectedRoot $expectedRootCertificate `
+                    -ExpectedFqdn $ExpectedFqdn
+            ).Count
+        }
+        if ($remainingMaviCertificates -ne 0) {
+            throw 'Mavi WinRM Reset: Ein eindeutig Mavi-verwaltetes Serverzertifikat konnte nicht entfernt werden.'
+        }
+    }
+
+    if ($winRmScopeVerified -and $effectiveRootThumbprint -match '^[A-F0-9]{40}$') {
+        $otherMaviLeafCount = @(Get-MaviLeavesForRoot -ExpectedRoot $expectedRootCertificate).Count
+        if ($otherMaviLeafCount -eq 0 -and $null -ne $installedRootCertificate) {
+            $rootSnapshots = @(
+                $winRmCertificateSnapshots |
+                Where-Object { $_.ProviderPath -ceq [string]$installedRootCertificate.PSPath }
+            )
+            if ($rootSnapshots.Count -ne 1) {
+                throw 'Mavi WinRM Reset: Der Root-Zertifikatssnapshot ist vor der Löschung nicht eindeutig.'
+            }
+            $rootSnapshots[0].MutationAttempted = $true
+            Remove-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            $removedCertificates++
+        }
+    }
+
+    if (Test-Path -LiteralPath $workDirectory) {
+        $workDirectoryRemovalAttempted = $true
+        Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction Stop
+    }
+
+    if ($disableOpenSsh) {
+        # Die Bootstrap-CA wird nie über Subject/Issuer oder einen Inventory-
+        # Thumbprint autorisiert. Der Remote-Store muss bytegenau dem DER aus
+        # dem root-kontrollierten Controller-Archiv entsprechen.
+        foreach ($bootstrapCertificate in $bootstrapCertificatesToRemove) {
+            $bootstrapSnapshots = @(
+                $winRmCertificateSnapshots |
+                Where-Object { $_.ProviderPath -ceq [string]$bootstrapCertificate.Certificate.PSPath }
+            )
+            if ($bootstrapSnapshots.Count -ne 1) {
+                throw 'Mavi Remote-Aus: Der Bootstrap-CA-Snapshot ist vor der Löschung nicht eindeutig.'
+            }
+            $bootstrapSnapshots[0].MutationAttempted = $true
+            Remove-Item -LiteralPath $bootstrapCertificate.Path -Force -ErrorAction Stop
+            $removedBootstrapCertificates++
+        }
+        foreach ($bootstrapRootThumbprint in $BootstrapRootThumbprints) {
+            $bootstrapRootPath = "Cert:\LocalMachine\Root\$bootstrapRootThumbprint"
+            if (Test-Path -LiteralPath $bootstrapRootPath) {
+                throw 'Mavi Remote-Aus: Eine exakt erwartete Bootstrap-CA ist weiterhin im Windows Root Store vorhanden.'
+            }
+        }
+        $bootstrapScopeVerified = $true
+    }
+}
+catch {
+    $cleanupError = $_.Exception.Message
+}
+
+if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
+    throw "Mavi WinRM Reset wurde nicht vollständig ausgeführt: $cleanupError"
+}
+
+# Die destruktive Finalisierung beginnt erst nach vollständig erfolgreichem
+# Cleanup. Scheitert sie selbst, wird der vorherige Dienstzustand ebenfalls
+# wiederhergestellt, statt einen halb abgeschalteten Zugang zu hinterlassen.
+try {
+    # Die ursprüngliche Richtlinie wird noch unter vollständiger
+    # Netzwerkisolation zurückgeschrieben. Danach wird WinRM gestoppt und
+    # deaktiviert; erst dann dürfen die temporären Block-Regeln verschwinden.
+    Restore-MaviAllowNegotiatePolicy
+    Stop-Service -Name WinRM -Force -ErrorAction Stop
+    Set-Service -Name WinRM -StartupType Disabled -ErrorAction Stop
+    $service = Get-Service -Name WinRM -ErrorAction Stop
+    $serviceStartValue = [int](Get-ItemPropertyValue `
+        -LiteralPath $winRmServicePath `
+        -Name Start `
+        -ErrorAction Stop
+    )
+    if (
+        ($winRmScopeVerified -and ($remainingMaviListeners -ne 0 -or $remainingMaviCertificates -ne 0)) -or
+        [string]$service.Status -ne 'Stopped' -or
+        $serviceStartValue -ne 4
+    ) {
+        throw 'Mavi WinRM Reset: Der abschließende Stand-0-Nachweis ist fehlgeschlagen.'
+    }
+    Remove-MaviResetIsolationRules
+}
+catch {
+    $finalizationError = $_.Exception.Message
+    throw "Mavi WinRM Reset konnte WinRM nicht sicher deaktivieren: $finalizationError"
+}
+
+if ($disableOpenSsh) {
+    try {
+        # Der Task wurde bereits im falliblen Preflight vor jeder destruktiven
+        # WinRM-Aenderung registriert und eindeutig ausgelesen.
+        $openSshMutationStarted = $true
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $taskStartDeadline = (Get-Date).AddSeconds(6)
+        do {
+            Start-Sleep -Milliseconds 250
+            $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            $scheduledTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop
+            if ($scheduledTask.State -eq 'Running' -or $scheduledTaskInfo.LastRunTime -gt $beforeTaskRun) {
+                $openSshDisableScheduled = $true
+                break
+            }
+        } while ((Get-Date) -lt $taskStartDeadline)
+        if (-not $openSshDisableScheduled) {
+            throw 'Mavi Remote-Aus: Der kontrollierte sshd-Stopp konnte nicht gestartet werden.'
+        }
+
+        $sshdStopDeadline = (Get-Date).AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 250
+            $sshdService = Get-Service -Name sshd -ErrorAction Stop
+            $sshdStartValue = [int](Get-ItemPropertyValue `
+                -LiteralPath $sshdServicePath `
+                -Name Start `
+                -ErrorAction Stop
+            )
+            $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            $scheduledTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop
+            if (
+                [string]$sshdService.Status -eq 'Stopped' -and
+                $sshdStartValue -eq 4 -and
+                [string]$scheduledTask.State -ne 'Running'
+            ) {
+                if ([int]$scheduledTaskInfo.LastTaskResult -ne 0) {
+                    throw "Mavi Remote-Aus: Der SYSTEM-Task endete mit Code $($scheduledTaskInfo.LastTaskResult)."
+                }
+                $openSshStoppedVerified = $true
+                $openSshStartupDisabled = $true
+                $openSshState = [string]$sshdService.Status
+                $openSshStartMode = 'Disabled'
+                break
+            }
+        } while ((Get-Date) -lt $sshdStopDeadline)
+        if (-not $openSshStoppedVerified) {
+            throw 'Mavi Remote-Aus: Der gestartete SYSTEM-Task hat sshd nicht nachweisbar gestoppt und deaktiviert.'
+        }
+
+        # Der einmalige Task wird noch vor dem Entfernen der Zugangsdaten
+        # vollständig abgeräumt. Ein Fehler ist dadurch weiterhin rollbackbar.
+        Unregister-ScheduledTask `
+            -TaskName $taskName `
+            -Confirm:$false `
+            -ErrorAction Stop
+        $taskRegistered = $false
+
+        if ($originalKeyFileExists) {
+            $keyLines = @(Get-Content -LiteralPath $keyFile -ErrorAction Stop)
+            $keptKeyLines = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($keyLineObject in $keyLines) {
+                $keyLine = [string]$keyLineObject
+                $trimmedKeyLine = $keyLine.Trim()
+                $isMaviKey = $false
+                if (-not [string]::IsNullOrWhiteSpace($CurrentKeyMarker)) {
+                    $markerPattern = '(^|\s)' + [regex]::Escape($CurrentKeyMarker) + '(\s|$)'
+                    $isMaviKey = $trimmedKeyLine -match $markerPattern
+                }
+                if (
+                    -not $isMaviKey -and
+                    -not [string]::IsNullOrWhiteSpace($CurrentKeyPrefix) -and
+                    ($trimmedKeyLine -eq $CurrentKeyPrefix -or $trimmedKeyLine.StartsWith($CurrentKeyPrefix + ' '))
+                ) {
+                    $isMaviKey = $true
+                }
+                if ($isMaviKey) {
+                    $removedOpenSshKeys++
+                    continue
+                }
+                $keptKeyLines.Add($keyLine)
+            }
+            if ($removedOpenSshKeys -gt 0) {
+                $keyRewriteAttempted = $true
+                [System.IO.File]::WriteAllLines(
+                    $keyFile,
+                    [string[]]$keptKeyLines,
+                    [System.Text.Encoding]::ASCII
+                )
+            }
+        }
+
+        if (Test-Path -LiteralPath $keyFile -PathType Leaf) {
+            foreach ($remainingKeyLineObject in @(Get-Content -LiteralPath $keyFile -ErrorAction Stop)) {
+                $remainingKeyLine = ([string]$remainingKeyLineObject).Trim()
+                $remainingIsMaviKey = $false
+                if (-not [string]::IsNullOrWhiteSpace($CurrentKeyMarker)) {
+                    $markerPattern = '(^|\s)' + [regex]::Escape($CurrentKeyMarker) + '(\s|$)'
+                    $remainingIsMaviKey = $remainingKeyLine -match $markerPattern
+                }
+                if (
+                    -not $remainingIsMaviKey -and
+                    -not [string]::IsNullOrWhiteSpace($CurrentKeyPrefix) -and
+                    ($remainingKeyLine -eq $CurrentKeyPrefix -or $remainingKeyLine.StartsWith($CurrentKeyPrefix + ' '))
+                ) {
+                    $remainingIsMaviKey = $true
+                }
+                if ($remainingIsMaviKey) {
+                    throw 'Mavi Remote-Aus: Ein Mavi-OpenSSH-Schlüssel ist weiterhin vorhanden.'
+                }
+            }
+        }
+
+        # Die aktive sshd_config wird bewusst nicht zurückgeschrieben. Nur die
+        # eindeutig vom Mavi-Starter erzeugte Sicherung wird entfernt.
+        if ($originalOpenSshConfigBackupExists) {
+            $configBackupRemovalAttempted = $true
+            Remove-Item -LiteralPath $openSshConfigBackup -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $openSshConfigBackup) {
+                throw 'Mavi Remote-Aus: Die Mavi-sshd-Konfigurationssicherung ist weiterhin vorhanden.'
+            }
+            $removedOpenSshConfigBackups++
+        }
+
+        $rulesToRemove = @(Get-NetFirewallRule -Name $OpenSshFirewallRuleName -ErrorAction SilentlyContinue)
+        foreach ($rule in $rulesToRemove) {
+            Remove-NetFirewallRule -InputObject $rule -ErrorAction Stop
+            $removedOpenSshFirewallRules++
+        }
+        if (@(Get-NetFirewallRule -Name $OpenSshFirewallRuleName -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw 'Mavi Remote-Aus: Die Mavi-OpenSSH-Firewallregel ist weiterhin vorhanden.'
+        }
+    }
+    catch {
+        $openSshFinalizationError = $_.Exception.Message
+        $rollbackErrors = New-Object 'System.Collections.Generic.List[string]'
+
+        if ($taskRegistered) {
+            try {
+                $taskRollbackDeadline = (Get-Date).AddSeconds(30)
+                do {
+                    $taskForRollback = Get-ScheduledTask `
+                        -TaskName $taskName `
+                        -ErrorAction SilentlyContinue
+                    if ($null -eq $taskForRollback) {
+                        break
+                    }
+                    $taskStateForRollback = [string]$taskForRollback.State
+                    if ($taskStateForRollback -notin @('Running', 'Queued')) {
+                        break
+                    }
+                    Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                    Start-Sleep -Milliseconds 250
+                } while ((Get-Date) -lt $taskRollbackDeadline)
+
+                $taskForRollback = Get-ScheduledTask `
+                    -TaskName $taskName `
+                    -ErrorAction SilentlyContinue
+                if (
+                    $null -ne $taskForRollback -and
+                    [string]$taskForRollback.State -in @('Running', 'Queued')
+                ) {
+                    throw 'Der OpenSSH-Finalizer-Task konnte vor dem Rollback nicht sicher beendet werden.'
+                }
+                Unregister-ScheduledTask `
+                    -TaskName $taskName `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+                if ($null -ne (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
+                    throw 'Der OpenSSH-Finalizer-Task ist nach dem Rollback weiterhin registriert.'
+                }
+                $taskRegistered = $false
+            }
+            catch {
+                [void]$rollbackErrors.Add("Scheduled Task: $($_.Exception.Message)")
+            }
+        }
+
+        if ($openSshMutationStarted) {
+            if ($keyRewriteAttempted) {
+                try {
+                    if ($originalKeyFileExists) {
+                        [System.IO.File]::WriteAllBytes($keyFile, $originalKeyFileBytes)
+                    }
+                    else {
+                        Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                catch {
+                    [void]$rollbackErrors.Add("OpenSSH-Key: $($_.Exception.Message)")
+                }
+            }
+
+            if ($configBackupRemovalAttempted) {
+                try {
+                    if ($originalOpenSshConfigBackupExists) {
+                        [System.IO.File]::WriteAllBytes(
+                            $openSshConfigBackup,
+                            $originalOpenSshConfigBackupBytes
+                        )
+                    }
+                }
+                catch {
+                    [void]$rollbackErrors.Add("sshd-Konfigurationssicherung: $($_.Exception.Message)")
+                }
+            }
+
+            if ($originalOpenSshFirewallRuleExists) {
+                try {
+                    $currentOpenSshRules = @(
+                        Get-NetFirewallRule `
+                            -Name $OpenSshFirewallRuleName `
+                            -ErrorAction SilentlyContinue
+                    )
+                    if ($currentOpenSshRules.Count -eq 0) {
+                        New-NetFirewallRule `
+                            -Name $OpenSshFirewallRuleName `
+                            -DisplayName $originalOpenSshFirewallDisplayName `
+                            -Enabled $originalOpenSshFirewallRuleEnabledValue `
+                            -Direction Inbound `
+                            -Protocol TCP `
+                            -Action Allow `
+                            -LocalPort 22 `
+                            -RemoteAddress $originalOpenSshFirewallRemoteAddresses `
+                            -Profile Any `
+                            -EdgeTraversalPolicy Block `
+                            -ErrorAction Stop | Out-Null
+                    }
+                    elseif ($currentOpenSshRules.Count -eq 1) {
+                        if ($originalOpenSshFirewallRuleEnabledValue -eq 'True') {
+                            Enable-NetFirewallRule -InputObject $currentOpenSshRules[0] -ErrorAction Stop
+                        }
+                        else {
+                            Disable-NetFirewallRule -InputObject $currentOpenSshRules[0] -ErrorAction Stop
+                        }
+                    }
+                    else {
+                        throw 'Die Mavi-OpenSSH-Firewallregel ist beim Rollback nicht eindeutig.'
+                    }
+                }
+                catch {
+                    [void]$rollbackErrors.Add("OpenSSH-Firewall: $($_.Exception.Message)")
+                }
+            }
+
+            try {
+                Restore-MaviSshdServiceState `
+                    -OriginalStatus $originalSshdStatus `
+                    -OriginalStartValue $originalSshdStartValue `
+                    -OriginalDelayedAutoStart $originalSshdDelayedAutoStart `
+                    -OriginalDelayedAutoStartExists $originalSshdDelayedAutoStartExists `
+                    -ServicePath $sshdServicePath
+            }
+            catch {
+                [void]$rollbackErrors.Add("sshd-Dienst: $($_.Exception.Message)")
+            }
+        }
+
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Mavi Remote-Aus: OpenSSH-Finalisierung fehlgeschlagen: $openSshFinalizationError; Rollback unvollständig: $($rollbackErrors -join '; ')"
+        }
+        if ($openSshMutationStarted) {
+            throw "Mavi Remote-Aus: OpenSSH-Finalisierung fehlgeschlagen, der ursprüngliche SSH-Zugang wurde wiederhergestellt: $openSshFinalizationError"
+        }
+        throw "Mavi Remote-Aus: OpenSSH-Finalizer konnte ohne Zugangsänderung nicht vorbereitet werden: $openSshFinalizationError"
+    }
+}
+}
+catch {
+    $resetError = $_.Exception.Message
+    $rollbackErrors = New-Object 'System.Collections.Generic.List[string]'
+
+    # Ein im Preflight registrierter, aber noch nicht gestarteter Task darf bei
+    # einem WinRM-Fehler nicht spaeter unvermittelt den SSH-Zugang abschalten.
+    if ($taskRegistered) {
+        try {
+            $taskForRollback = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($null -ne $taskForRollback -and [string]$taskForRollback.State -in @('Running', 'Queued')) {
+                Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            }
+            Unregister-ScheduledTask `
+                -TaskName $taskName `
+                -Confirm:$false `
+                -ErrorAction Stop
+            $taskRegistered = $false
+        }
+        catch {
+            [void]$rollbackErrors.Add("Scheduled Task: $($_.Exception.Message)")
+        }
+    }
+
+    $providerReadyForRollback = $false
+    if ($winRmMutationStarted) {
+        try {
+            Enable-MaviWinRmProviderMaintenance
+            $providerReadyForRollback = $true
+        }
+        catch {
+            [void]$rollbackErrors.Add("WSMan-Wartungsmodus: $($_.Exception.Message)")
+        }
+    }
+
+    if ($winRmMutationStarted -and $providerReadyForRollback) {
+        try {
+            Restore-MaviWinRmArtifacts
+        }
+        catch {
+            [void]$rollbackErrors.Add("WinRM-Artefakte: $($_.Exception.Message)")
+        }
+    }
+
+    $policyRestored = $false
+    if ($winRmMaintenanceAttempted) {
+        try {
+            Restore-MaviAllowNegotiatePolicy
+            $policyRestored = $true
+        }
+        catch {
+            [void]$rollbackErrors.Add("WinRM-AllowNegotiate-Richtlinie: $($_.Exception.Message)")
+        }
+    }
+
+    $serviceRestored = $false
+    if ($winRmMaintenanceAttempted) {
+        try {
+            if ($policyRestored -and $originalWinRmStatus -eq 'Running') {
+                # Den ursprünglichen Richtlinienwert sicher in den laufenden
+                # Dienst übernehmen, solange beide Netzwerkports blockiert sind.
+                Restart-Service -Name WinRM -Force -ErrorAction Stop
+            }
+            Restore-MaviWinRmServiceState `
+                -OriginalStatus $originalWinRmStatus `
+                -OriginalStartValue $originalWinRmStartValue `
+                -OriginalDelayedAutoStart $originalWinRmDelayedAutoStart `
+                -OriginalDelayedAutoStartExists $originalWinRmDelayedAutoStartExists
+            $serviceRestored = $true
+        }
+        catch {
+            [void]$rollbackErrors.Add("WinRM-Dienst: $($_.Exception.Message)")
+        }
+    }
+
+    if ($winRmMaintenanceAttempted -and $policyRestored -and $serviceRestored) {
+        try {
+            Remove-MaviResetIsolationRules
+        }
+        catch {
+            [void]$rollbackErrors.Add("WinRM-Wartungsfirewall: $($_.Exception.Message)")
+        }
+    }
+
+    if ($rollbackErrors.Count -gt 0) {
+        throw "Mavi Remote-Aus fehlgeschlagen: $resetError; Rollback unvollstaendig: $($rollbackErrors -join '; ')"
+    }
+    if ($winRmMutationStarted) {
+        throw "Mavi Remote-Aus fehlgeschlagen; WinRM-Artefakte und Dienstzustand wurden wiederhergestellt: $resetError"
+    }
+    throw "Mavi Remote-Aus wurde vor der ersten destruktiven WinRM-Aenderung abgebrochen: $resetError"
+}
+
+$result = [ordered]@{
     RemovedListeners = $removedListeners
     RemovedCertificates = $removedCertificates
     RemovedFirewallRules = $removedFirewallRules
+    RemovedOpenSshFirewallRules = $removedOpenSshFirewallRules
     RemovedOpenSshKeys = $removedOpenSshKeys
+    RemovedOpenSshConfigBackups = $removedOpenSshConfigBackups
+    RemovedBootstrapCertificates = $removedBootstrapCertificates
+    BootstrapScopeVerified = $bootstrapScopeVerified
     OpenSshDisableScheduled = $openSshDisableScheduled
+    OpenSshStartupDisabled = $openSshStartupDisabled
+    OpenSshStoppedVerified = $openSshStoppedVerified
+    OpenSshState = $openSshState
+    OpenSshStartMode = $openSshStartMode
     WinRMState = [string]$service.Status
     WinRMStartMode = 'Disabled'
+    WinRmScopeVerified = $winRmScopeVerified
+    WinRmListenersCleared = $winRmListenersCleared
+    PreservedForeignWinRmListeners = $preservedWinRmListeners
+    WinRmRootThumbprint = $effectiveRootThumbprint
+    BootstrapRootThumbprint = @($BootstrapRootThumbprints | Select-Object -First 1)[0]
+    BootstrapRootThumbprints = @($BootstrapRootThumbprints)
 }
+$marker = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Compress)))
+$Ansible.Result = @{ Marker = $marker }
 $Ansible.Changed = $true
 '''
     return [{
@@ -2828,17 +5159,28 @@ $Ansible.Changed = $true
         "gather_facts": False,
         "tasks": [
             {
-                "name": "WinRM-Listener, Mavi-Zertifikate, Regeln und Richtlinien entfernen",
+                "name": "Eindeutig Mavi-verwaltete WinRM-Artefakte entfernen",
                 "ansible.windows.win_powershell": {
                     "error_action": "stop",
                     "script": powershell,
                     "parameters": {
                         "RootThumbprint": root_thumbprint,
+                        "RootCertificateDerBase64": root_certificate_der_base64,
+                        "ExpectedFqdn": expected_fqdn,
+                        "BootstrapRootCertificatesDerBase64": normalized_bootstrap_certificates,
                         "DisableOpenSshValue": 1 if disable_openssh else 0,
                         "CurrentKeyPrefix": public_key_prefix,
                         "CurrentKeyMarker": key_marker,
                         "OpenSshFirewallRuleName": openssh_firewall_rule,
+                        "OpenSshConfigBackupPath": openssh_config_backup,
                     },
+                },
+                "register": "mavi_remote_management_reset",
+            },
+            {
+                "name": "Mavi Rückbau-Ergebnis auslesen",
+                "ansible.builtin.debug": {
+                    "msg": "Mavi_REMOTE_RESET_B64={{ mavi_remote_management_reset.result.Marker }}",
                 },
             },
         ],
@@ -2866,6 +5208,7 @@ __all__ = (
     "_effective_host_var",
     "_connection_label",
     "_clear_host_transport_vars",
+    "_apply_remote_management_disabled_transport",
     "_apply_ssh_transport",
     "_apply_psrp_transport",
     "_psrp_https_inventory_vars",
@@ -2887,6 +5230,9 @@ __all__ = (
     "_vault_host_context",
     "_vault_ansible_user_for_host",
     "_winrm_pki_paths",
+    "_validate_inventory_host_alias",
+    "_validate_new_host_alias",
+    "_safe_host_token",
     "_winrm_local_command",
     "_ensure_winrm_ca",
     "_winrm_leaf_openssl_config",
@@ -2908,6 +5254,8 @@ __all__ = (
     "_ensure_psrp_kerberos_controller_dependencies",
     "_is_missing_gssapi_failure",
     "_temporary_psrp_vault_inventory",
+    "_retain_single_inventory_host",
+    "_temporary_single_host_inventory",
     "_vault_psrp_password_for_host",
     "_discard_kerberos_ticket_cache",
     "_verify_kerberos_ticket_cache",
