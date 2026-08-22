@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.11-oss
+
+- Die vollständige Funktionsoberfläche startet in einer platzsparenden Kurzansicht und lässt sich mit `M` auf- und wieder einklappen; alle bisherigen Nummern bleiben als Direkteingaben verfügbar.
+
 ## 0.9.9-oss
 
 - `ping` verwendet nun dieselbe private, vorab geprüfte Kerberos-Sitzung und denselben kurzlebigen Ticket-Cache wie die übrigen Client-Aktionen; ein temporäres Ein-Host-Inventar verhindert dabei Ansible-Pattern-Erweiterungen.
