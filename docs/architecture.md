@@ -55,26 +55,35 @@ Programmeinstieg. Die Implementierung liegt im neutral benannten Paket
 `windows_provisioner`, damit portable Änderungen aus dem Firmenprojekt an
 denselben Pfaden übernommen werden können.
 
-| Modul | Verantwortung |
+Die bekannten Fachmodule bleiben als stabile Importfassaden erhalten. Die
+Implementierung ist darunter nach jeweils einer Verantwortung aufgeteilt:
+
+| Fassade | Implementierungsmodule |
 | --- | --- |
-| `_dependencies.py` | Standardbibliothek und optionale Python-Abhängigkeiten |
-| `settings.py` | Produktversion, Standardpfade und Datenvorlagen |
-| `templates.py` | Ansible- und PowerShell-Vorlagen |
-| `environment.py` | Projekt-, Datei-, Pfad- und Umgebungsverwaltung |
-| `installer_analysis.py` | Installer- und Silent-Switch-Analyse |
-| `catalogs.py` | Kataloge, Parameterprofile und interaktive Auswahl |
-| `software.py` | Office-, WinGet-, Store- und Softwareaufnahme-Workflows |
-| `reports.py` | Terminal-/HTML-Berichte und redigierte Ausgaben |
-| `printers.py` | INF-Analyse, Druckerkatalog und Installation |
-| `remote.py` | Transport-, Kerberos- und WinRM-Grundlagen |
-| `openssh.py` | OpenSSH-Bootstrap und Remotezugriffs-Workflows |
-| `execution.py` | Inventory-, Ansible- und Installationsausführung |
-| `clients.py` | Windows-Clientoptimierung und Programmbereinigung |
-| `cli.py` | Menüs, Argumentparser und Programmeinstieg |
+| `cli.py` | `cli_menu.py`, `cli_parser.py` |
+| `catalogs.py` | `catalog_selection.py`, `catalog_storage.py`, `catalog_parameters.py`, `catalog_contexts.py`, `catalog_editing.py`, `catalog_menu.py`, `catalog_products.py` |
+| `software.py` | `software_office.py`, `software_catalog.py`, `software_winget.py`, `software_manual.py` |
+| `execution.py` | `execution_inventory.py`, `execution_hosts.py`, `execution_process.py`, `execution_ping.py`, `execution_install.py`, `execution_credentials.py` |
+| `installer_analysis.py` | `installer_rules.py`, `installer_switches.py`, `installer_rule_commands.py`, `installer_metadata.py`, `installer_workflow.py` |
+| `printers.py` | `printer_inf.py`, `printer_catalog.py`, `printer_install.py` |
+| `clients.py` | `client_runtime.py`, `client_optimization.py`, `client_uninstall.py`, `client_menu.py` |
+| `environment.py` | `environment_files.py`, `environment_paths.py`, `environment_installers.py`, `environment_mavi.py` |
+| `reports.py` | `report_catalog.py`, `report_redaction.py`, `report_html.py`, `report_commands.py`, `report_security.py` |
+| `remote.py` | `remote_transport.py`, `remote_kerberos.py`, `remote_pki.py`, `remote_cleanup.py`, `remote_session.py`, `remote_play_runner.py`, `remote_winrm_install.py`, `remote_winrm_reset.py` |
+| `openssh.py` | `openssh_keys.py`, `openssh_scripts.py`, `openssh_bootstrap.py`, `openssh_commands.py`, `openssh_winrm.py`, `openssh_cleanup.py`, `openssh_audit.py`, `openssh_menu.py`, `openssh_lifecycle.py` |
+| `templates.py` | `template_printers.py`, `template_installation.py`, `template_clients.py` |
+
+`_dependencies.py` bündelt weiterhin Standardbibliothek und optionale
+Python-Abhängigkeiten. `settings.py` enthält Produktversion, Standardpfade und
+persistierte Datenvorlagen. Bestehende Imports aus den Fassaden funktionieren
+weiter; neue Logik gehört direkt in das fachlich zuständige
+Implementierungsmodul.
 
 Abhängigkeiten zwischen Fachmodulen werden explizit im jeweiligen Workflow
-importiert. Es gibt keine nachträglich verdrahtete globale Registry und keine
-gegenseitigen Importzyklen.
+importiert. Interne Implementierungen greifen bei fachinternen Abhängigkeiten
+über einen lokalen Import auf die stabile Fassade zu. Es gibt keine
+nachträglich verdrahtete globale Registry und keine Importzyklen beim
+Paketstart.
 
 ## Synchronisation mit Ansible-Windows-Script
 

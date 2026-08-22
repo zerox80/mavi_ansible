@@ -145,5 +145,8 @@ Store, Windows-Client-Optimierung und Programmbereinigung, OpenSSH, PSRP/WinRM
 und Diagnosen. Sie startet in einer platzsparenden Kurzansicht. Mit `M` werden
 alle Menüpunkte angezeigt und mit derselben Taste wieder eingeklappt. Die
 bisherigen Nummern bleiben unverändert und können auch in der Kurzansicht
-direkt eingegeben werden. Die Architektur ist in
+direkt eingegeben werden. Die bekannten Fachmodule unter
+`windows_provisioner/` bleiben stabile Importfassaden; die Implementierung ist
+in kleinere Auswahl-, Speicher-, Laufzeit-, Transport-, PKI-, Audit- und
+UI-Module aufgeteilt. Die Architektur ist in
 [docs/architecture.md](docs/architecture.md) beschrieben.
