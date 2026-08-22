@@ -6,6 +6,10 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.11 makes the complete function surface compact by default. ``M`` expands
+or collapses all established actions while every numeric shortcut remains
+available for direct input in either view.
+
 v0.9.10 safely removes a selected Windows PC from the Ansible inventory via
 the TUI or ``host remove``. It reloads and validates the inventory after the
 confirmation prompt so unrelated concurrent changes are preserved, and it

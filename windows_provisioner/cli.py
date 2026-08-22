@@ -10,6 +10,59 @@ from ._dependencies import (
     re,
 )
 
+
+_LEGACY_MENU_ITEMS = (
+    ("1", "Normale Software hinzufügen"),
+    ("2", "Microsoft-Produkt hinzufügen"),
+    ("3", "Software-Katalog anzeigen"),
+    ("4", "Software installieren"),
+    ("5", "Kataloge verwalten"),
+    ("6", "Neuen PC hinzufügen"),
+    ("7", "PCs anzeigen"),
+    ("8", "Verbindung testen (win_ping)"),
+    ("9", "Dateien initialisieren / prüfen"),
+    ("10", "Drucker verwalten / installieren"),
+    ("11", "OpenSSH / Windows-Verbindung verwalten"),
+    ("12", "Optionen / TUI anpassen"),
+    ("13", "WinGet-Software suchen / hinzufügen"),
+    ("14", "Microsoft Store-App suchen / hinzufügen"),
+    ("15", "Windows-Client optimieren / Programme bereinigen"),
+    ("16", "PC aus der Liste entfernen"),
+)
+
+_LEGACY_MENU_COMPACT_KEYS = frozenset({"1", "3", "4", "6", "7", "8"})
+_LEGACY_MENU_TOGGLE_CHOICES = frozenset({"m", "mehr", "+"})
+
+
+def _render_legacy_menu(default_catalog: str, expanded: bool) -> str:
+    """Rendert die vollständige Funktionsoberfläche kurz oder aufgeklappt."""
+    visible_items = (
+        _LEGACY_MENU_ITEMS
+        if expanded
+        else tuple(
+            item
+            for item in _LEGACY_MENU_ITEMS
+            if item[0] in _LEGACY_MENU_COMPACT_KEYS
+        )
+    )
+    item_lines = "\n".join(
+        f" {number:>2}) {label}" for number, label in visible_items
+    )
+    toggle_label = "Weniger anzeigen" if expanded else "Mehr anzeigen"
+
+    return (
+        "\n"
+        "╔══════════════════════════════════════╗\n"
+        "║   MAVI PROVISIONER — VOLLVERSION      ║\n"
+        "╚══════════════════════════════════════╝\n"
+        f" Standardkatalog: {default_catalog}\n"
+        "\n"
+        f"{item_lines}\n"
+        f"  M) {toggle_label}\n"
+        "  0) Beenden\n"
+    )
+
+
 def legacy_menu(project: Path) -> None:
     from .catalogs import (
         catalog_menu,
@@ -43,37 +96,18 @@ def legacy_menu(project: Path) -> None:
     )
 
     ensure_initialized(project, quiet=True)
+    expanded = False
 
     while True:
         default_catalog = get_default_catalog_name(project)
 
-        print(
-            "\n"
-            "╔══════════════════════════════════════╗\n"
-            "║   MAVI PROVISIONER — VOLLVERSION      ║\n"
-            "╚══════════════════════════════════════╝\n"
-            f" Standardkatalog: {default_catalog}\n"
-            "\n"
-            "  1) Normale Software hinzufügen\n"
-            "  2) Microsoft-Produkt hinzufügen\n"
-            "  3) Software-Katalog anzeigen\n"
-            "  4) Software installieren\n"
-            "  5) Kataloge verwalten\n"
-            "  6) Neuen PC hinzufügen\n"
-            "  7) PCs anzeigen\n"
-            "  8) Verbindung testen (win_ping)\n"
-            "  9) Dateien initialisieren / prüfen\n"
-            " 10) Drucker verwalten / installieren\n"
-            " 11) OpenSSH / Windows-Verbindung verwalten\n"
-            " 12) Optionen / TUI anpassen\n"
-            " 13) WinGet-Software suchen / hinzufügen\n"
-            " 14) Microsoft Store-App suchen / hinzufügen\n"
-            " 15) Windows-Client optimieren / Programme bereinigen\n"
-            " 16) PC aus der Liste entfernen\n"
-            "  0) Beenden\n"
-        )
+        print(_render_legacy_menu(default_catalog, expanded))
 
         choice = input("> ").strip()
+
+        if choice.casefold() in _LEGACY_MENU_TOGGLE_CHOICES:
+            expanded = not expanded
+            continue
 
         try:
             if choice == "1":

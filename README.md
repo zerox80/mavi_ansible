@@ -142,5 +142,8 @@ abzuzeichnen. Beiträge sind willkommen; siehe [CONTRIBUTING.md](CONTRIBUTING.md
 Die vollständige Funktionsoberfläche enthält weiterhin Katalogverwaltung,
 Parameterprofile, Office-/Microsoft-Assistent, Drucker, WinGet, Microsoft
 Store, Windows-Client-Optimierung und Programmbereinigung, OpenSSH, PSRP/WinRM
-und Diagnosen. Die Architektur ist in
+und Diagnosen. Sie startet in einer platzsparenden Kurzansicht. Mit `M` werden
+alle Menüpunkte angezeigt und mit derselben Taste wieder eingeklappt. Die
+bisherigen Nummern bleiben unverändert und können auch in der Kurzansicht
+direkt eingegeben werden. Die Architektur ist in
 [docs/architecture.md](docs/architecture.md) beschrieben.
