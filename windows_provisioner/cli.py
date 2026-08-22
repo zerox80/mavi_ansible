@@ -1031,6 +1031,7 @@ Beispiele:
   # PCs
   mavi-provisioner host add PC-001 10.10.20.101
   mavi-provisioner host list
+  mavi-provisioner host remove PC-001
   mavi-provisioner ping PC-001
 
   # Windows-Client optimieren / klassische Programme bereinigen

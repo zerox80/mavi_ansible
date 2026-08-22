@@ -222,8 +222,12 @@ class HostRemoveTests(unittest.TestCase):
 
         with (
             mock.patch(
-                "windows_provisioner.catalogs.get_default_catalog_name",
-                return_value="default",
+                "windows_provisioner.environment.get_config",
+                return_value={"profile": {"name": "Test"}},
+            ),
+            mock.patch(
+                "windows_provisioner.environment._mavi_profile_ready",
+                return_value=True,
             ),
             mock.patch(
                 "windows_provisioner.catalogs.choose_host_interactive",
@@ -233,7 +237,7 @@ class HostRemoveTests(unittest.TestCase):
             mock.patch(
                 "windows_provisioner.execution.cmd_host_remove"
             ) as remove_mock,
-            mock.patch("builtins.input", side_effect=["16", "0"]),
+            mock.patch("builtins.input", side_effect=["4", "7", "0", "0"]),
             mock.patch("builtins.print"),
         ):
             cli.menu(project)
