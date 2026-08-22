@@ -27,6 +27,7 @@ def legacy_menu(project: Path) -> None:
     from .execution import (
         cmd_host_add,
         cmd_host_list,
+        cmd_host_remove,
         cmd_install,
         cmd_ping,
         selected_apps_need_user,
@@ -68,6 +69,7 @@ def legacy_menu(project: Path) -> None:
             " 13) WinGet-Software suchen / hinzufügen\n"
             " 14) Microsoft Store-App suchen / hinzufügen\n"
             " 15) Windows-Client optimieren / Programme bereinigen\n"
+            " 16) PC aus der Liste entfernen\n"
             "  0) Beenden\n"
         )
 
@@ -283,6 +285,16 @@ def legacy_menu(project: Path) -> None:
 
             elif choice == "15":
                 client_menu(project)
+
+            elif choice == "16":
+                host = choose_host_interactive(project)
+                cmd_host_remove(
+                    argparse.Namespace(
+                        project=project,
+                        name=host,
+                        yes=False,
+                    )
+                )
 
             elif choice == "0":
                 print("Tschüss.")
@@ -702,6 +714,7 @@ def mavi_pc_menu(project: Path) -> None:
     from .execution import (
         cmd_host_add,
         cmd_host_list,
+        cmd_host_remove,
         cmd_ping,
     )
     from .openssh import ssh_menu
@@ -720,6 +733,7 @@ def mavi_pc_menu(project: Path) -> None:
         print("  4) Verbindung testen (win_ping)")
         print("  5) Doctor für einen PC ausführen")
         print("  6) Windows-Client optimieren / Programme bereinigen")
+        print("  7) PC aus der Liste entfernen")
         print("  0) Zurück")
         print()
         choice = input("> ").strip()
@@ -776,6 +790,13 @@ def mavi_pc_menu(project: Path) -> None:
                 ))
             elif choice == "6":
                 client_menu(project)
+            elif choice == "7":
+                host = choose_host_interactive(project)
+                cmd_host_remove(argparse.Namespace(
+                    project=project,
+                    name=host,
+                    yes=False,
+                ))
             elif choice == "0":
                 return
             else:
@@ -887,6 +908,7 @@ def build_parser() -> argparse.ArgumentParser:
         cmd_credentials_setup,
         cmd_host_add,
         cmd_host_list,
+        cmd_host_remove,
         cmd_install,
         cmd_ping,
     )
@@ -1009,6 +1031,7 @@ Beispiele:
   # PCs
   mavi-provisioner host add PC-001 10.10.20.101
   mavi-provisioner host list
+  mavi-provisioner host remove PC-001
   mavi-provisioner ping PC-001
 
   # Windows-Client optimieren / klassische Programme bereinigen
@@ -1660,6 +1683,23 @@ Ohne --catalog wird immer der aktuell gesetzte Standardkatalog verwendet. Im int
         help="Windows-PCs anzeigen",
     )
     p_hl.set_defaults(func=cmd_host_list)
+
+    p_hr = host_sub.add_parser(
+        "remove",
+        help="Windows-PC aus dem Inventory entfernen",
+    )
+    p_hr.add_argument(
+        "name",
+        nargs="?",
+        help="Inventory-Hostname; ohne Angabe interaktiv aus der Liste auswählen",
+    )
+    p_hr.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Ohne Rückfrage aus dem Inventory entfernen",
+    )
+    p_hr.set_defaults(func=cmd_host_remove)
 
     # --------------------------
     # OpenSSH / Windows

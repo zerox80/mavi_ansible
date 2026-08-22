@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mavi-provisioner"
-version = "0.9.9"
+version = "0.9.10"
 description = "TUI-first Windows provisioning with Ansible"
 readme = "README.md"
 requires-python = ">=3.11"

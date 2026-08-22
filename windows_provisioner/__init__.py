@@ -6,6 +6,12 @@ Mavi Provisioner
 
 TUI-first provisioning for Windows endpoints with Ansible.
 
+v0.9.10 safely removes a selected Windows PC from the Ansible inventory via
+the TUI or ``host remove``. It reloads and validates the inventory after the
+confirmation prompt so unrelated concurrent changes are preserved, and it
+aborts if the selected entry changed. The endpoint and its remote configuration
+remain untouched.
+
 v0.9.9 binds the standalone connectivity check to the same private,
 pre-validated Kerberos session as installation and client actions. ``win_ping``
 uses the detected Ansible Python runtime and a short-lived ticket cache while

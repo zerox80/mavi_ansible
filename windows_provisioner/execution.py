@@ -267,6 +267,65 @@ def cmd_host_list(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_host_remove(args: argparse.Namespace) -> None:
+    from .catalogs import (
+        choose_host_interactive,
+        yes_no,
+    )
+    from .environment import (
+        atomic_write_yaml,
+        die,
+        ensure_initialized,
+        project_paths,
+    )
+
+    ensure_initialized(args.project, quiet=True)
+
+    name = getattr(args, "name", None)
+    if not name:
+        name = choose_host_interactive(args.project)
+
+    inv = load_inventory(args.project)
+    windows = ensure_windows_tree(inv)
+    hosts = windows.get("hosts", {})
+    if not isinstance(hosts, dict):
+        die("Windows-Inventory enthält keine gültige Host-Zuordnung.")
+    if name not in hosts:
+        die(f"PC '{name}' ist nicht im Windows-Inventory vorhanden.")
+
+    selected_host_entry = hosts[name]
+    host_data = selected_host_entry if isinstance(selected_host_entry, dict) else {}
+    ip = str(host_data.get("ansible_host", "") or "")
+    pc_label = f"PC '{name}'" + (f" ({ip})" if ip else "")
+    if not bool(getattr(args, "yes", False)) and not yes_no(
+        f"{pc_label} wirklich aus dem Inventory entfernen?",
+        default=False,
+    ):
+        print("Abgebrochen.")
+        return
+
+    # Die Bestätigung kann beliebig lange offen bleiben. Deshalb den aktuellen
+    # Inventory-Stand danach erneut laden, damit parallele Änderungen an anderen
+    # Hosts nicht mit dem vor der Rückfrage gelesenen Snapshot überschrieben werden.
+    current_inv = load_inventory(args.project)
+    current_windows = ensure_windows_tree(current_inv)
+    current_hosts = current_windows.get("hosts", {})
+    if not isinstance(current_hosts, dict):
+        die("Windows-Inventory enthält keine gültige Host-Zuordnung.")
+    if name not in current_hosts:
+        die(f"PC '{name}' wurde zwischenzeitlich aus dem Inventory entfernt.")
+    if current_hosts[name] != selected_host_entry:
+        die(
+            f"Der Inventory-Eintrag von PC '{name}' wurde zwischenzeitlich geändert. "
+            "Bitte Entfernung erneut starten und den aktuellen Eintrag bestätigen."
+        )
+
+    del current_hosts[name]
+    atomic_write_yaml(project_paths(args.project)["inventory"], current_inv)
+    print(f"✓ {pc_label} aus dem Inventory entfernt.")
+    print("  Der Windows-PC selbst und seine Remote-Konfiguration wurden nicht verändert.")
+
+
 def shlex_quote(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=,@+-]+", value):
         return value
@@ -2589,6 +2648,7 @@ __all__ = (
     "ensure_windows_tree",
     "cmd_host_add",
     "cmd_host_list",
+    "cmd_host_remove",
     "shlex_quote",
     "run_subprocess",
     "ANSI_ESCAPE_RE",

@@ -37,6 +37,16 @@ Die Startansicht führt in dieser Reihenfolge durch die erste Umgebung:
 4. **Software, Kataloge und Microsoft-Produkte** – Installer, WinGet,
    Microsoft Store und Drucker einrichten.
 
+Windows-PCs können unter **PCs & Verbindung** aus der vorhandenen Liste
+entfernt werden. Alternativ steht dafür der CLI-Befehl zur Verfügung:
+
+~~~bash
+python3 mavi_provisioner.py host remove PC-001
+~~~
+
+Dabei wird nur der Eintrag im Ansible-Inventory entfernt. Der Windows-PC und
+seine Remote-Konfiguration bleiben unverändert.
+
 Produktiv ist pro Controller-VM genau ein Laufzeitprojekt vorgesehen. Mit
 `--project` wählst du dessen Speicherort:
 
